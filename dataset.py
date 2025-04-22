@@ -46,7 +46,7 @@ def create_attention_mask_after_first_eos(input_ids, eos_token_id=0):
 def longest_reproducible_prefix_decoding(input_ids, tokenizer, max_offset=5):
     for offset in range(max_offset):
         input_ids_offset = input_ids[:, :input_ids.shape[1]-offset]
-        text = tokenizer.decode(input_ids_offset[0], skip_special_tokens=False)
+        text = tokenizer.decode(input_ids_offset[0], skip_special_tokens=False, clean_up_tokenization_spaces=False)
         text = text.replace('<|begin_of_text|>', '')
         text = text.replace('<|end_of_text|>', '')
         input_ids_reproduced = tokenizer([text], return_tensors='pt').input_ids
@@ -127,14 +127,13 @@ def read_data(dataset_name, usage):
     elif dataset_name in ["dailydialog", "dailydialog_emotion", "dailydialog_intent"]:
         # train / validation / test
         # 87k / 8k / 7.7k
-        # dataset = load_dataset("daily_dialog") # from huggingface
-        dataset = load_from_disk("./dailydialog") # from local
+        dataset = load_dataset("./dailydialog", download_config=download_config, trust_remote_code=True)
         dataset = dataset[usage]
         dataset_ = []
         for item in dataset:
             context = ""
             for utterance, emotion, intent in zip(
-                item["dialog"], item["emotion"], item["act"]
+                item["utterances"], item["emotions"], item["acts"]
             ):
                 if len(context) > 0:
                     dataset_.append({
@@ -688,7 +687,3 @@ if __name__ == "__main__":
             assert response_reconstructed.endswith("<|end_of_text|>")
             response_reconstructed = response_reconstructed[:-len("<|end_of_text|>")]
             assert response_reconstructed == response
-
-            #print(f"prompt: {prompt}")
-            #print(f"response: {response}")
-            #input()

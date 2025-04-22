@@ -20,7 +20,7 @@ def set_seed(args):
 
 def set_default_output_dir(args):
     if args.output_dir is None:
-        args.output_dir = os.path.join(root, f"sft/{args.base_model_name}-{args.dataset_name}-v4")
+        args.output_dir = os.path.join(root, f"sft/{args.base_model_name}-{args.dataset_name}")
     if args.epochs != 3:
         args.output_dir = args.output_dir + f"-ep{args.epochs}"
     if (args.global_batch_size, args.mini_batch_size) != (64, 8):
@@ -28,12 +28,9 @@ def set_default_output_dir(args):
 
 
 if __name__ == "__main__":
-    parser = get_basic_parser(epochs=10)
+    parser = get_basic_parser(epochs=3)
 
     args = parser.parse_args()
-    args.epochs = 3
-    args.global_batch_size = 32
-    args.mini_batch_size = 4
     time.sleep(args.local_rank * 10)
     set_default_output_dir(args)
     check_output_dir(args)
@@ -42,7 +39,6 @@ if __name__ == "__main__":
     train_dataset = SFTDataset(tokenizer_path=args.base_model_name, dataset_name=args.dataset_name, usage="train")
     valid_dataset = SFTDataset(tokenizer_path=args.base_model_name, dataset_name=args.dataset_name, usage="validation")
     model = AutoModelForCausalLM.from_pretrained(args.base_model_name, device_map=f"cuda:{args.local_rank}")
-    model.config.attention_dropout = 0.1
 
     trainer = get_trainer(
         args=args,

@@ -1,44 +1,34 @@
-import csv
-import hashlib
-import json
 import os
+import csv
+import json
 import random
-import time
-from collections import defaultdict, Counter
+import hashlib
+from collections import Counter
 from typing import Union
 
-import torch.nn.functional as F
-import numpy as np
 import torch
-import spacy
-import argparse
-from nltk import ngrams
-from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForCausalLM, LlamaForCausalLM, RobertaForSequenceClassification, \
-    AutoConfig
-from transformers.modeling_utils import load_sharded_checkpoint, load_state_dict
-import torch.distributions as dist
-
-from evaluate import load
-from config import workspace, root
+import torch.nn.functional as F
+from transformers import AutoTokenizer, LlamaForCausalLM, RobertaForSequenceClassification
+from config import root
 from datasets import DownloadConfig
 from dataset import SFTDataset, One2ManyDataset, eot_token, ClassificationDataset, right_padding_to_left_padding, \
-    ComparisonDataset, get_dataset_indexed_labels, convert_style, polish
-from modeling_llama_cvae import LlamaForLatentDPO, LlamaForCVAE
-from utils import get_last_checkpoint, get_last_checkpoint_at_root, load_sharded_prefix_checkpoint, get_basic_parser
-from models import AutoModelForCVAE
+    ComparisonDataset, get_dataset_indexed_labels, polish
+from modeling_llama_cvae import LlamaForCVAE
+from utils import get_last_checkpoint
 from utils_latent import sampling, log_pdf, exp_mean_log
-
 from train_cvae import set_default_output_dir
+
 torch.set_printoptions(precision=3, sci_mode=False)
 
-version = "v7"
-version_results = "v7.0"
+version = "release"
+version_results = "release"
 
-ks = [16] # for latent manipulation
+ks = [16]  # for latent manipulation
 
-if not os.path.exists("evaluate"):
+if not os.path.exists("evaluate") and os.path.exists(root):
+    # link to the local evaluate library
     os.system(f"ln -s {root}/evaluate evaluate")
+
 
 def round_tensor(tensor):
     if isinstance(tensor, torch.Tensor):
@@ -65,11 +55,10 @@ def compute_mauve(responses, references, model_id="gpt2-large", n_clusters: Unio
 
 @torch.no_grad()
 def compute_perplexity(responses, model_id="gpt2-large"):
-    return np.nan
     torch.cuda.empty_cache()
     perplexity = load("evaluate/metrics/perplexity", module_type="metric")
     results = perplexity.compute(predictions=responses, model_id=model_id, device='cuda')
-    #return results['mean_perplexity']
+    # return results['mean_perplexity']
     # we exclude abnormal points through only analyzing results from 1% to 99%
     perplexities = results["perplexities"]
     lower_bound = np.percentile(perplexities, 1)
@@ -121,7 +110,7 @@ def compute_self_bleu(responses):
         return compute_bleu(
             responses=responses,
             references=[
-                [responses[i] for i in range(len(responses)) if i!=j]
+                [responses[i] for i in range(len(responses)) if i != j]
                 for j in range(len(responses))
             ]
         )
@@ -158,7 +147,8 @@ def compute_bleu_cross(results):
         except ZeroDivisionError:
             bleu_recall = 0
         bleu_scores.append((bleu_precision, bleu_recall))
-    return np.mean([bleu_score[0] for bleu_score in bleu_scores]), np.mean([bleu_score[1] for bleu_score in bleu_scores])
+    return np.mean([bleu_score[0] for bleu_score in bleu_scores]), np.mean(
+        [bleu_score[1] for bleu_score in bleu_scores])
 
 
 def compute_bleu_cross_mp(results):
@@ -188,10 +178,12 @@ def compute_rouge(responses, references, use_aggregator=True, use_stemmer=False)
                             use_aggregator=use_aggregator, use_stemmer=use_stemmer)
     return results
 
+
 import numpy as np
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 from evaluate import load
+
 
 def compute_single_rouge(response, reference, use_aggregator, use_stemmer):
     rouge = load("evaluate/metrics/rouge")
@@ -200,13 +192,15 @@ def compute_single_rouge(response, reference, use_aggregator, use_stemmer):
         use_aggregator=use_aggregator, use_stemmer=use_stemmer
     )
 
+
 def compute_rouge_mp(responses, references, use_aggregator=True, use_stemmer=False):
     keys = ["rouge1", "rouge2", "rougeL", "rougeLsum"]
     results = []
 
     with ProcessPoolExecutor() as executor:
         future_to_response = {
-            executor.submit(compute_single_rouge, response, reference, use_aggregator, use_stemmer): (response, reference)
+            executor.submit(compute_single_rouge, response, reference, use_aggregator, use_stemmer): (
+                response, reference)
             for response, reference in zip(responses, references)
         }
 
@@ -230,6 +224,7 @@ def compute_distinct(responses):
         total_ngrams = sum(all_ngrams.values())
         distinct_ngrams = len(all_ngrams)
         return distinct_ngrams / total_ngrams if total_ngrams > 0 else 0
+
     results = {
         f"distinct-{n}": distinct_n(responses, n)
         for n in [1, 2, 3, 4]
@@ -240,7 +235,7 @@ def compute_distinct(responses):
 @torch.no_grad()
 def compute_mauve_for_results(results):
     from mauve.compute_mauve import get_features_from_input, compute_mauve
-    torch.eye(3).cuda() # ensure cuda available
+    torch.eye(3).cuda()  # ensure cuda available
     all_references = []
     all_responses = []
     for result in results:
@@ -276,8 +271,8 @@ def compute_mauve_for_results(results):
     all_mauve_scores = []
     for i in tqdm(range(len(results))):
         mauve_score = compute_mauve(
-            p_features=all_responses_features[32*i:32*(i+1), :],
-            q_features=all_references_features[32*i:32*(i+1), :],
+            p_features=all_responses_features[32 * i:32 * (i + 1), :],
+            q_features=all_references_features[32 * i:32 * (i + 1), :],
             num_buckets=8,
         ).mauve
         all_mauve_scores.append(mauve_score)
@@ -288,18 +283,19 @@ def compute_rouge_for_chunk(chunk):
     responses, references = chunk
     return compute_rouge(responses=responses, references=references)
 
+
 def compute_singular_rouge_for_results(results, chunk_size=1024):
     responses = [response for result in results for response in result["responses"]]
     references = [reference for result in results for reference in result["references"]]
     n = len(responses)
-    chunks = [(responses[i:i + chunk_size], references[i:i + chunk_size]) 
+    chunks = [(responses[i:i + chunk_size], references[i:i + chunk_size])
               for i in range(0, n, chunk_size)]
-    
+
     chunks_results = []
     with ProcessPoolExecutor() as executor:
         for chunk_results in tqdm(executor.map(compute_rouge_for_chunk, chunks), total=len(chunks)):
             chunks_results.append(chunk_results)
-    
+
     rouge_results = {
         key: np.sum([
             chunk_results[key] * len(chunk[0]) / n
@@ -315,14 +311,14 @@ def compute_group_rouge_for_results(results, chunk_size=128):
     responses = ["\n".join(result["responses"]) for result in results]
     references = ["\n".join(result["references"]) for result in results]
     n = len(responses)
-    chunks = [(responses[i:i + chunk_size], references[i:i + chunk_size]) 
+    chunks = [(responses[i:i + chunk_size], references[i:i + chunk_size])
               for i in range(0, n, chunk_size)]
-    
+
     chunks_results = []
     with ProcessPoolExecutor() as executor:
         for chunk_results in tqdm(executor.map(compute_rouge_for_chunk, chunks), total=len(chunks)):
             chunks_results.append(chunk_results)
-    
+
     rouge_results = {
         key: np.sum([
             chunk_results[key] * len(chunk[0]) / n
@@ -330,12 +326,13 @@ def compute_group_rouge_for_results(results, chunk_size=128):
         ])
         for key in ["rouge1", "rouge2", "rougeL", "rougeLsum"]
     }
-    
+
     return rouge_results
 
 
 def compute_distinct_for_chunk(chunk):
     return [compute_distinct(responses=responses) for responses in chunk]
+
 
 def compute_distinct_for_results(results, chunk_size=32):
     all_responses = [result["responses"] for result in results]
@@ -346,7 +343,7 @@ def compute_distinct_for_results(results, chunk_size=32):
     with ProcessPoolExecutor() as executor:
         for chunk_results in tqdm(executor.map(compute_distinct_for_chunk, chunks), total=len(chunks)):
             chunks_results.append(chunk_results)
-    
+
     distinct_results = {
         key: np.mean([
             result[key]
@@ -362,6 +359,7 @@ def compute_distinct_for_results(results, chunk_size=32):
 def compute_selfbleu_for_chunk(chunk):
     return [compute_self_bleu(responses=responses) for responses in chunk]
 
+
 def compute_selfbleu_for_results(results, chunk_size=32):
     all_responses = [result["responses"] for result in results]
     n = len(all_responses)
@@ -371,7 +369,7 @@ def compute_selfbleu_for_results(results, chunk_size=32):
     with ProcessPoolExecutor() as executor:
         for chunk_results in tqdm(executor.map(compute_selfbleu_for_chunk, chunks), total=len(chunks)):
             chunks_results.append(chunk_results)
-    
+
     selfbleu_results = {
         key: np.mean([
             result[key]
@@ -515,25 +513,34 @@ class TestGroundBase:
 
         # Prepare the row to be added to the CSV
         model_name = f"{self.args.dataset_name}-{self.strategy_name()}"
+
         def extend_probs(probs: list):
-            return probs + [np.nan] * (5-len(probs))
+            return probs + [np.nan] * (5 - len(probs))
+
         for k in ks:
             for index_feature in range(len(get_dataset_indexed_labels(self.args.dataset_name))):
                 row = [
                     model_name, k, index_feature,
                     manipulated_results[0]["references_ppl"],
-                    *extend_probs(np.array([result["references_probs"] for result in manipulated_results]).mean(axis=1).mean(axis=0).tolist()),
+                    *extend_probs(
+                        np.array([result["references_probs"] for result in manipulated_results]).mean(axis=1).mean(
+                            axis=0).tolist()),
                     manipulated_results[0]["reconstructed_ppl"],
-                    *extend_probs(np.array([result["reconstructed_probs"] for result in manipulated_results]).mean(axis=1).mean(axis=0).tolist()),
+                    *extend_probs(
+                        np.array([result["reconstructed_probs"] for result in manipulated_results]).mean(axis=1).mean(
+                            axis=0).tolist()),
                     *[np.mean([result["reconstructed_rouge"][key] for result in manipulated_results])
                       for key in ["rouge1", "rouge2", "rougeL", "rougeLsum"]],
                     *[np.mean([result["reconstructed_debertascore"][key] for result in manipulated_results])
                       for key in ["precision", "recall", "f1"]],
                     manipulated_results[0][f"manipulated_ppl-{index_feature}@{k}"],
-                    *extend_probs(np.array([result[f"manipulated_probs-{index_feature}@{k}"] for result in manipulated_results]).mean(axis=1).mean(axis=0).tolist()),
+                    *extend_probs(np.array(
+                        [result[f"manipulated_probs-{index_feature}@{k}"] for result in manipulated_results]).mean(
+                        axis=1).mean(axis=0).tolist()),
                     *[np.mean([result[f"manipulated_rouge-{index_feature}@{k}"][key] for result in manipulated_results])
                       for key in ["rouge1", "rouge2", "rougeL", "rougeLsum"]],
-                    *[np.mean([result[f"manipulated_debertascore-{index_feature}@{k}"][key] for result in manipulated_results])
+                    *[np.mean([result[f"manipulated_debertascore-{index_feature}@{k}"][key] for result in
+                               manipulated_results])
                       for key in ["precision", "recall", "f1"]],
                     args.cvae_model_path,
                     os.path.exists(os.path.join(args.output_dir, "trainer_state.json"))
@@ -591,7 +598,7 @@ class TestGroundBase:
               for key in ["rouge1", "rouge2", "rougeL", "rougeLsum"]],
             *[round_tensor([interpolation_results[i]["rouge_b"][key] for i in range(11)])
               for key in ["rouge1", "rouge2", "rougeL", "rougeLsum"]],
-            *[round_tensor([(interpolation_results[i]["rouge_a"][key]+interpolation_results[i]["rouge_b"][key])/2
+            *[round_tensor([(interpolation_results[i]["rouge_a"][key] + interpolation_results[i]["rouge_b"][key]) / 2
                             for i in range(11)])
               for key in ["rouge1", "rouge2", "rougeL", "rougeLsum"]],
             args.cvae_model_path,
@@ -606,7 +613,7 @@ class TestGroundBase:
                 writer.writerow(header)
             writer.writerow(row)
 
-    def test_prior_mean_greedy(self):
+    def test_dailydialog(self):
         self.load_model()
         dataset = SFTDataset(
             tokenizer_path=self.args.base_model_name,
@@ -636,7 +643,8 @@ class TestGroundBase:
                     **generation_config,
                 )
             prompt_length = inputs["input_ids"].shape[1]
-            response = dataset.tokenizer.batch_decode(response_ids[:, prompt_length:], skip_special_tokens=False, clean_up_tokenization_spaces=False)[0]
+            response = dataset.tokenizer.batch_decode(response_ids[:, prompt_length:], skip_special_tokens=False,
+                                                      clean_up_tokenization_spaces=False)[0]
             cut_tail_after = lambda string, eos: string if eos not in string else string[:string.index(eos)]
             response = cut_tail_after(response, dataset.tokenizer.eos_token)
             response = cut_tail_after(response, eot_token)
@@ -670,16 +678,6 @@ class TestGroundBase:
         for key in keys:
             print(f"response-{key}: {np.mean([scores[key] for scores in all_scores]):.3f}")
         print(f"response-overall: {np.mean([scores[key] for scores in all_scores for key in keys]):.3f}")
-        """
-        all_scores = []
-        for prompt, reference in zip(tqdm(prompts), references):
-            conversation = prompt.replace(eot_token, " <|endoftext|> ") + reference
-            scores = fed.evaluate(conversation, model, tokenizer)
-            all_scores.append(scores)
-        for key in keys:
-            print(f"reference-{key}: {np.mean([scores[key] for scores in all_scores]):.3f}")
-        print(f"reference-overall: {np.mean([scores[key] for scores in all_scores for key in keys]):.3f}")
-        """
 
 
 class TestGroundForSFT(TestGroundBase):
@@ -697,7 +695,7 @@ class TestGroundForSFT(TestGroundBase):
     def strategy_name(self):
         return self.args.vae_type
 
-    def test_sampling_single(self):
+    def test_dailydialog(self):
         temperature = self.args.temperature
         cache_file = os.path.join(self.args.sft_model_path,
                                   f"test_sampling_single_temp{int(temperature * 10):02d}_{version}.json")
@@ -755,7 +753,8 @@ class TestGroundForSFT(TestGroundBase):
             for result, output in zip(results, outputs):
                 assert result["prompt"] == output.prompt
                 # result["responses"] = [output.outputs[i].text for i in range(32)]
-                result["response"] = dataset.tokenizer.batch_decode([output.outputs[0].token_ids], clean_up_tokenization_spaces=False)[0]
+                result["response"] = \
+                    dataset.tokenizer.batch_decode([output.outputs[0].token_ids], clean_up_tokenization_spaces=False)[0]
             with open(cache_file, "w", encoding='utf-8') as f:
                 f.write(json.dumps(results, ensure_ascii=False, indent=4))
 
@@ -802,7 +801,8 @@ class TestGroundForSFT(TestGroundBase):
         print(f"response-overall: {np.mean([scores[key] for scores in all_scores for key in keys]):.3f}")
 
     def test_sampling(self, temperature=1.0):
-        cache_file = os.path.join(self.args.sft_model_path, f"test_sampling_temp{int(temperature*10):02d}_{version}.json")
+        cache_file = os.path.join(self.args.sft_model_path,
+                                  f"test_sampling_temp{int(temperature * 10):02d}_{version}.json")
         if os.path.exists(cache_file) and not args.erase:
             with open(cache_file, "r", encoding='utf-8') as f:
                 results = json.loads(f.read())
@@ -844,13 +844,15 @@ class TestGroundForSFT(TestGroundBase):
             )
             for result, output in zip(results, outputs):
                 assert result["prompt"] == output.prompt
-                #result["responses"] = [output.outputs[i].text for i in range(32)]
-                result["responses"] = [dataset.tokenizer.batch_decode([output.outputs[i].token_ids], clean_up_tokenization_spaces=False) for i in range(32)]
+                # result["responses"] = [output.outputs[i].text for i in range(32)]
+                result["responses"] = [
+                    dataset.tokenizer.batch_decode([output.outputs[i].token_ids], clean_up_tokenization_spaces=False)
+                    for i in range(32)]
             with open(cache_file, "w", encoding='utf-8') as f:
                 f.write(json.dumps(results, ensure_ascii=False, indent=4))
 
         if args.small_test:
-            results = [result for i,result in enumerate(results) if i%10 == 0]
+            results = [result for i, result in enumerate(results) if i % 10 == 0]
 
         cut_tail_after = lambda string, eos: string if eos not in string else string[:string.index(eos)]
         for result in results:
@@ -860,7 +862,7 @@ class TestGroundForSFT(TestGroundBase):
         print(f"dataset: {self.args.dataset_name}")
         print(f"temperature: {temperature}")
         mauve_scores = compute_mauve_for_results(results)
-        print(f"mauve_scores: {np.mean(mauve_scores)*100:.2f} +/- {np.std(mauve_scores)*100:.2f}")
+        print(f"mauve_scores: {np.mean(mauve_scores) * 100:.2f} +/- {np.std(mauve_scores) * 100:.2f}")
         singular_rouge_scores = compute_singular_rouge_for_results(results)
         print(f"singular_rouge_scores:\n{json.dumps(singular_rouge_scores, ensure_ascii=False, indent=4)}")
         group_rouge_scores = compute_group_rouge_for_results(results)
@@ -871,13 +873,14 @@ class TestGroundForSFT(TestGroundBase):
         print(f"selfbleu_scores:\n{json.dumps(selfbleu_scores, ensure_ascii=False, indent=4)}")
 
     def test_posterior_inference(self):
-        cache_file = os.path.join(self.args.sft_model_path, ("small_" if self.args.small_test else "") + ("sampled_" if "sampling" in self.args.vae_type else "") + f"test_prior_unbiased_inference_{version}.json")
+        cache_file = os.path.join(self.args.sft_model_path, ("small_" if self.args.small_test else "") + (
+            "sampled_" if "sampling" in self.args.vae_type else "") + f"test_prior_unbiased_inference_{version}.json")
         if os.path.exists(cache_file) and not self.args.erase:
             with open(cache_file, "r", encoding='utf-8') as f:
                 results = json.loads(f.read())
         else:
-            if os.path.exists(cache_file+".cache") and not self.args.erase:
-                with open(cache_file+".cache", "r", encoding='utf-8') as f:
+            if os.path.exists(cache_file + ".cache") and not self.args.erase:
+                with open(cache_file + ".cache", "r", encoding='utf-8') as f:
                     cached_results = json.loads(f.read())
             else:
                 cached_results = {}
@@ -890,7 +893,7 @@ class TestGroundForSFT(TestGroundBase):
             generation_config = {
                 "num_return_sequences": 1,
                 "do_sample": False,
-                #"temperature": self.args.temperature,
+                # "temperature": self.args.temperature,
                 "max_new_tokens": dataset.max_output_length,
                 "min_new_tokens": 2,
             }
@@ -902,7 +905,7 @@ class TestGroundForSFT(TestGroundBase):
                 references = dataset.one2many_inference[index]["responses"]
                 if str(index) in cached_results:
                     result: dict = cached_results[str(index)]
-                    if not all([result.get(k, None)==v for k,v in {
+                    if not all([result.get(k, None) == v for k, v in {
                         "prompt": prompt,
                         "reference": reference,
                         "references": references
@@ -919,51 +922,52 @@ class TestGroundForSFT(TestGroundBase):
                             **inputs,
                             **generation_config,
                         )
-                    responses = dataset.tokenizer.batch_decode(response_ids[:, prompt_length:], skip_special_tokens=False)
+                    responses = dataset.tokenizer.batch_decode(response_ids[:, prompt_length:],
+                                                               skip_special_tokens=False)
                     cut_tail_after = lambda string, eos: string if eos not in string else string[:string.index(eos)]
                     responses = [cut_tail_after(response, dataset.tokenizer.eos_token) for response in responses]
                     responses = [cut_tail_after(response, eot_token) for response in responses]
-                    responses = ["." if len(response)==0 else response for response in responses]
+                    responses = ["." if len(response) == 0 else response for response in responses]
                     references = [cut_tail_after(reference, dataset.tokenizer.eos_token) for reference in references]
                     references = [cut_tail_after(reference, eot_token) for reference in references]
-                    #mauve_score, _ = compute_mauve(responses, references, n_clusters=8)
-                    #distinct = compute_distinct(responses=responses)
-                    #bleu = compute_bleu(responses=responses, references=[references for _ in responses])
-                    #rouge = compute_rouge(responses=responses, references=[references for _ in responses])
-                    #selfbleu = compute_self_bleu(responses=responses)
+                    # mauve_score, _ = compute_mauve(responses, references, n_clusters=8)
+                    # distinct = compute_distinct(responses=responses)
+                    # bleu = compute_bleu(responses=responses, references=[references for _ in responses])
+                    # rouge = compute_rouge(responses=responses, references=[references for _ in responses])
+                    # selfbleu = compute_self_bleu(responses=responses)
                     result = {
                         "prompt": prompt,
                         "reference": reference,
                         "references": references,
                         "responses": responses,
-                        #"mauve_score": mauve_score,
-                        #"distinct": distinct,
-                        #"bleu": bleu,
-                        #"rouge": rouge,
-                        #"selfbleu": selfbleu,
+                        # "mauve_score": mauve_score,
+                        # "distinct": distinct,
+                        # "bleu": bleu,
+                        # "rouge": rouge,
+                        # "selfbleu": selfbleu,
                     }
                 results[index] = result
-                if len(results) % (len(indexes)//10) == 0:
-                    with open(cache_file+".cache", "w", encoding='utf-8') as f:
+                if len(results) % (len(indexes) // 10) == 0:
+                    with open(cache_file + ".cache", "w", encoding='utf-8') as f:
                         f.write(json.dumps(results, ensure_ascii=False, indent=4))
             with open(cache_file, "w", encoding='utf-8') as f:
                 f.write(json.dumps(results, ensure_ascii=False, indent=4))
         results = list(results.values())
-        #mauve_score = np.mean([result["mauve_score"] for result in results])
-        #distinct = {k:np.mean([result["distinct"][k] for result in results])
+        # mauve_score = np.mean([result["mauve_score"] for result in results])
+        # distinct = {k:np.mean([result["distinct"][k] for result in results])
         #            for k in ['distinct-1', 'distinct-2', 'distinct-3', 'distinct-4']}
-        #bleu = {k:np.mean([result["bleu"][k] for result in results])
+        # bleu = {k:np.mean([result["bleu"][k] for result in results])
         #        for k in ['bleu-1', 'bleu-2', 'bleu-3', 'bleu-4']}
-        #rouge = {k:np.mean([result["rouge"][k] for result in results])
+        # rouge = {k:np.mean([result["rouge"][k] for result in results])
         #         for k in ['rouge1', 'rouge2', 'rougeL', 'rougeLsum']}
-        #selfbleu = {k:np.mean([result["selfbleu"][k] for result in results])
+        # selfbleu = {k:np.mean([result["selfbleu"][k] for result in results])
         #             for k in ['bleu-1', 'bleu-2', 'bleu-3', 'bleu-4']}
         # update in v6.2
         # re-compute rouge scores
-        #rouge = compute_rouge_mp(
+        # rouge = compute_rouge_mp(
         #    responses = [response for result in results for response in result["responses"]],
         #    references = [reference for result in results for reference in result["references"]],
-        #)
+        # )
         mauve_score = np.mean(compute_mauve_for_results(results))
         rouge = compute_singular_rouge_for_results(results)
         distinct = compute_distinct_for_results(results)
@@ -972,7 +976,7 @@ class TestGroundForSFT(TestGroundBase):
         results = {
             "mauve_score": mauve_score,
             "distinct": distinct,
-            #"bleu": bleu,
+            # "bleu": bleu,
             "selfbleu": selfbleu,
             "rouge": rouge,
         }
@@ -980,13 +984,14 @@ class TestGroundForSFT(TestGroundBase):
 
     def test_prior_inference_with_different_temperature(self):
         temperatures = [0.1, 0.4, 0.7, 1.0]
-        cache_file = os.path.join(self.args.sft_model_path, ("small_" if args.small_test else "") + f"test_prior_temperature_inference_{version}.json")
+        cache_file = os.path.join(self.args.sft_model_path, (
+            "small_" if args.small_test else "") + f"test_prior_temperature_inference_{version}.json")
         if os.path.exists(cache_file) and not args.erase:
             with open(cache_file, "r", encoding='utf-8') as f:
                 results = json.loads(f.read())
         else:
-            if os.path.exists(cache_file+".cache") and not args.erase:
-                with open(cache_file+".cache", "r", encoding='utf-8') as f:
+            if os.path.exists(cache_file + ".cache") and not args.erase:
+                with open(cache_file + ".cache", "r", encoding='utf-8') as f:
                     cached_results = json.loads(f.read())
             else:
                 cached_results = {}
@@ -1006,7 +1011,7 @@ class TestGroundForSFT(TestGroundBase):
             cut_tail_after = lambda string, eos: string if eos not in string else string[:string.index(eos)]
             indexes = range(0, len(dataset), 10 if args.small_test else 1)
             for temperature in temperatures:
-                temperature_repr = f"{int(temperature*10):02d}"
+                temperature_repr = f"{int(temperature * 10):02d}"
                 results[temperature_repr] = {}
                 for index in tqdm(indexes, desc=f"test_prior_temperature_inference_{temperature_repr}"):
                     prompt = dataset.one2many_inference[index]["prompt"]
@@ -1033,25 +1038,30 @@ class TestGroundForSFT(TestGroundBase):
                                 **generation_config,
                                 temperature=temperature,
                             )
-                        responses = dataset.tokenizer.batch_decode(response_ids[:, prompt_length:], skip_special_tokens=False)
+                        responses = dataset.tokenizer.batch_decode(response_ids[:, prompt_length:],
+                                                                   skip_special_tokens=False)
                         responses = [cut_tail_after(response, dataset.tokenizer.eos_token) for response in responses]
                         responses = [cut_tail_after(response, eot_token) for response in responses]
-                        responses = ["." if len(response)==0 else response for response in responses]
+                        responses = ["." if len(response) == 0 else response for response in responses]
                         result["responses"] = responses
                     results[temperature_repr][index] = result
-                with open(cache_file+".cache", "w", encoding='utf-8') as f:
+                with open(cache_file + ".cache", "w", encoding='utf-8') as f:
                     f.write(json.dumps(results, ensure_ascii=False, indent=4))
             with open(cache_file, "w", encoding='utf-8') as f:
                 f.write(json.dumps(results, ensure_ascii=False, indent=4))
 
         results["final_result"] = {
-            "mauve": [np.mean(compute_mauve_for_results(results[f"{int(temperature*10):02d}"].values())) for temperature in temperatures],
-            "rougeL": [compute_group_rouge_for_results(results[f"{int(temperature*10):02d}"].values())["rougeLsum"] for temperature in temperatures],
-            "distinct": [compute_distinct_for_results(results[f"{int(temperature*10):02d}"].values())["distinct-4"] for temperature in temperatures],
-            "selfbleu": [compute_selfbleu_for_results(results[f"{int(temperature*10):02d}"].values())["bleu-4"] for temperature in temperatures],
+            "mauve": [np.mean(compute_mauve_for_results(results[f"{int(temperature * 10):02d}"].values())) for
+                      temperature in temperatures],
+            "rougeL": [compute_group_rouge_for_results(results[f"{int(temperature * 10):02d}"].values())["rougeLsum"]
+                       for temperature in temperatures],
+            "distinct": [compute_distinct_for_results(results[f"{int(temperature * 10):02d}"].values())["distinct-4"]
+                         for temperature in temperatures],
+            "selfbleu": [compute_selfbleu_for_results(results[f"{int(temperature * 10):02d}"].values())["bleu-4"] for
+                         temperature in temperatures],
         }
         return results
-    
+
     def test_prior_inference(self):
         cache_file = os.path.join(self.args.sft_model_path, (
             "small_" if args.small_test else "") + f"test_posterior_inference_{version}.json")
@@ -1109,27 +1119,27 @@ class TestGroundForSFT(TestGroundBase):
                     cut_tail_after = lambda string, eos: string if eos not in string else string[:string.index(eos)]
                     responses = [cut_tail_after(response, dataset.tokenizer.eos_token) for response in responses]
                     responses = [cut_tail_after(response, eot_token) for response in responses]
-                    responses = ["." if len(response)==0 else response for response in responses]
+                    responses = ["." if len(response) == 0 else response for response in responses]
                     references = [cut_tail_after(reference, dataset.tokenizer.eos_token) for reference in references]
                     references = [cut_tail_after(reference, eot_token) for reference in references]
-                    #mauve_score, _ = compute_mauve(responses, references, n_clusters=8)
-                    #distinct = compute_distinct(responses=responses)
-                    #bleu = compute_bleu(responses=responses, references=[[reference] for reference in references])
-                    #rouge = compute_rouge(responses=responses, references=[[reference] for reference in references])
-                    #debertascore = compute_debertascore(responses=responses,
+                    # mauve_score, _ = compute_mauve(responses, references, n_clusters=8)
+                    # distinct = compute_distinct(responses=responses)
+                    # bleu = compute_bleu(responses=responses, references=[[reference] for reference in references])
+                    # rouge = compute_rouge(responses=responses, references=[[reference] for reference in references])
+                    # debertascore = compute_debertascore(responses=responses,
                     #                                    references=[[reference] for reference in references])
-                    #selfbleu = compute_self_bleu(responses=responses)
+                    # selfbleu = compute_self_bleu(responses=responses)
                     result = {
                         "prompt": prompt,
                         "reference": reference,
                         "references": references,
                         "responses": responses,
-                        #"mauve_score": mauve_score,
-                        #"distinct": distinct,
-                        #"bleu": bleu,
-                        #"rouge": rouge,
-                        #"debertascore": debertascore,
-                        #"selfbleu": selfbleu
+                        # "mauve_score": mauve_score,
+                        # "distinct": distinct,
+                        # "bleu": bleu,
+                        # "rouge": rouge,
+                        # "debertascore": debertascore,
+                        # "selfbleu": selfbleu
                     }
                 results[index] = result
                 if index % (len(indexes) // 10) == 0:
@@ -1138,24 +1148,24 @@ class TestGroundForSFT(TestGroundBase):
             with open(cache_file, "w", encoding='utf-8') as f:
                 f.write(json.dumps(results, ensure_ascii=False, indent=4))
         results = list(results.values())
-        #mauve_score = np.mean([result["mauve_score"] for result in results])
-        #distinct = {k: np.mean([result["distinct"][k] for result in results])
+        # mauve_score = np.mean([result["mauve_score"] for result in results])
+        # distinct = {k: np.mean([result["distinct"][k] for result in results])
         #            for k in ['distinct-1', 'distinct-2', 'distinct-3', 'distinct-4']}
-        #bleu = {k: np.mean([result["bleu"][k] for result in results])
+        # bleu = {k: np.mean([result["bleu"][k] for result in results])
         #        for k in ['bleu-1', 'bleu-2', 'bleu-3', 'bleu-4']}
-        #rouge = {k: np.mean([result["rouge"][k] for result in results])
+        # rouge = {k: np.mean([result["rouge"][k] for result in results])
         #         for k in ['rouge1', 'rouge2', 'rougeL', 'rougeLsum']}
-        #debertascore = {k: np.mean([result["debertascore"][k] for result in results])
+        # debertascore = {k: np.mean([result["debertascore"][k] for result in results])
         #                for k in ['precision', 'recall', 'f1']}
-        #selfbleu = {k: np.mean([result["selfbleu"][k] for result in results])
+        # selfbleu = {k: np.mean([result["selfbleu"][k] for result in results])
         #            for k in ['bleu-1', 'bleu-2', 'bleu-3', 'bleu-4']}
 
         # update in v6.2
         # re-compute rouge scores
-        #rouge = compute_rouge_mp(
+        # rouge = compute_rouge_mp(
         #    responses = ["\n".join(result["responses"]) for result in results],
         #    references = ["\n".join(result["references"]) for result in results],
-        #)
+        # )
 
         mauve_score = np.mean(compute_mauve_for_results(results))
         rouge = compute_group_rouge_for_results(results)
@@ -1165,9 +1175,9 @@ class TestGroundForSFT(TestGroundBase):
         results = {
             "mauve_score": mauve_score,
             "distinct": distinct,
-            #"bleu": bleu,
+            # "bleu": bleu,
             "rouge": rouge,
-            #"debertascore": debertascore,
+            # "debertascore": debertascore,
             "selfbleu": selfbleu,
         }
         return results
@@ -1254,7 +1264,7 @@ class TestGroundForSFT(TestGroundBase):
                 use_tqdm=True
             )
             num_unformatted = 0
-            for result,output in zip(results,outputs):
+            for result, output in zip(results, outputs):
                 prompt = output.prompt
                 formatted_output = output.outputs[0].text
                 print(f"prompt:\n{prompt}")
@@ -1296,17 +1306,96 @@ class TestGroundForVAE(TestGroundBase):
     def load_model(self):
         if not hasattr(self, "model"):
             load_kwargs = {"torch_dtype": torch.float16, "device_map": self.device}
-            model = LlamaForCVAE.from_pretrained(self.args.cvae_model_path, **load_kwargs)
+            model = LlamaForCVAE.from_pretrained(self.args.cvae_model_path, **load_kwargs).eval()
             self.model = model
         if not hasattr(self, "tokenizer"):
             tokenizer = AutoTokenizer.from_pretrained(self.args.cvae_model_path)
             self.tokenizer = tokenizer
 
     def strategy_name(self):
-        return (f"{self.args.vae_type}-{self.args.add_skip_connection}-{self.args.add_ghost_skip_connection}")
+        return (f"{self.args.vae_type}-{self.args.add_skip_connection}-{self.args.add_gskip_connection}")
+
+    def visualize_all_latent(self):
+        self.load_model()
+        dataset = One2ManyDataset(
+            tokenizer_path=self.args.base_model_name,
+            dataset_name=self.args.dataset_name,
+            usage="test", total_many=32, mini_many=32
+        )
+        print(f"dataset: {dataset}")
+
+        def compute_grid_logprobs(posterior_mean, posterior_logvar, bound=5, pixels=300):
+            # posterior_mean, posterior_logvar 均为 [batch_size, dim_z]
+            dim_z = posterior_mean.shape[1]
+            zs = (torch.arange(pixels).float() / pixels * 2 - 1) * bound
+            zs = zs.unsqueeze(1).repeat(1, dim_z).to(device=posterior_mean.device,
+                                                     dtype=posterior_mean.dtype)  # [pixels, dim_z]
+            logprobs = log_pdf(posterior_mean[None, :, :], posterior_logvar[None, :, :],
+                               zs[:, None, :])  # [pixels, batch_size, dim_z]
+            logprobs = torch.where(logprobs < -100, -100, logprobs)
+            logprobs = exp_mean_log(logprobs, dim=1)  # [pixels, dim_z]
+            return logprobs
+
+        def visualize_logprobs(logprobs, dimx=0, dimy=1, bound=5, pixels=300, figname=None):
+            # Convert log-probabilities to 2D probabilities
+            probs2d = (logprobs[:, dimx, None] + logprobs[None, :, dimy]).exp()
+            # Create grid coordinates
+            zs = (torch.arange(pixels).float() / pixels * 2 - 1) * bound
+            xx, yy = torch.meshgrid(zs, zs, indexing='ij')
+            # Convert to numpy for plotting
+            probs2d_np = probs2d.cpu().numpy()
+            xx_np = xx.cpu().numpy()
+            yy_np = yy.cpu().numpy()
+            # Plot
+            import matplotlib.pyplot as plt
+            import matplotlib.colors as mcolors
+            cmap = plt.get_cmap('jet')
+            new_cmap = mcolors.LinearSegmentedColormap.from_list(
+                'truncated_jet',
+                cmap(np.linspace(0.2, 0.8, 256))
+            )
+            plt.figure(figsize=(8, 6))
+            plt.pcolormesh(xx_np, yy_np, probs2d_np, shading='auto', vmin=0, vmax=0.25, cmap=new_cmap)
+            plt.colorbar(label='Probability Density')
+            plt.xlabel(f'Latent Dimension {dimx}')
+            plt.ylabel(f'Latent Dimension {dimy}')
+            plt.title('2D Probability Density in Latent Space')
+            plt.grid(True, alpha=0.25)
+            # Save to file
+            plt.savefig(figname or f'latent-{self.args.dataset_name}-{self.args.vae_type}.png', dpi=300,
+                        bbox_inches='tight')
+            plt.close()
+
+        all_posterior_mean = []
+        all_grid_logprobs = []
+        for index in tqdm(range(0, len(dataset), 10 if args.small_test else 1),
+                          desc="test_encoder_language_latent"):
+            batch_item = dataset[index]
+            input_ids = batch_item["input_ids"]
+            posterior_input_ids = input_ids
+            # [batch_size, seq_len]
+            posterior_input_ids, posterior_attention_mask = right_padding_to_left_padding(
+                posterior_input_ids,
+                self.tokenizer.eos_token_id,
+                self.tokenizer.pad_token_id,
+            )
+            # [batch_size, dim_z]
+            with torch.no_grad():
+                posterior_mean, posterior_logvar = self.model.latent_encoder(
+                    posterior_input_ids=posterior_input_ids.to(self.device),
+                    posterior_attention_mask=posterior_attention_mask.to(self.device),
+                )
+                all_posterior_mean.append(posterior_mean)
+                grid_logprobs = compute_grid_logprobs(posterior_mean, posterior_logvar)
+                all_grid_logprobs.append(grid_logprobs)
+        all_posterior_mean = torch.cat(all_posterior_mean, dim=0)  # [N * batch_size, dim_z]
+        variances = torch.var(all_posterior_mean, dim=0)
+        dimx, dimy = torch.topk(variances, k=2).indices
+        visualize_logprobs(exp_mean_log(torch.stack(all_grid_logprobs, dim=0), dim=0), dimx, dimy)
 
     def test_encoder_language_latent(self, n_samples=16, verbose=1):
-        cache_file = os.path.join(self.args.cvae_model_path, ("small_" if args.small_test else "") + f"test_encoder_language_latent_{version}.json")
+        cache_file = os.path.join(self.args.cvae_model_path, (
+            "small_" if args.small_test else "") + f"test_encoder_language_latent_{version}.json")
         if os.path.exists(cache_file) and not args.erase:
             with open(cache_file, "r", encoding='utf-8') as f:
                 results = json.loads(f.read())
@@ -1317,10 +1406,11 @@ class TestGroundForVAE(TestGroundBase):
                 dataset_name=self.args.dataset_name,
                 usage="test", total_many=32, mini_many=32
             )
-            au_thresh = [0.03, 0.1, 0.3]#[0.01, 0.03, 0.1]
-            cu_thresh = [0.03, 0.1, 0.3]#[0.01, 0.03, 0.1]
+            au_thresh = [0.03, 0.1, 0.3]  # [0.01, 0.03, 0.1]
+            cu_thresh = [0.03, 0.1, 0.3]  # [0.01, 0.03, 0.1]
             results = []
-            for index in tqdm(range(0, len(dataset), 10 if args.small_test else 1), desc="test_encoder_language_latent"):
+            for index in tqdm(range(0, len(dataset), 10 if args.small_test else 1),
+                              desc="test_encoder_language_latent"):
                 batch_item = dataset[index]
                 input_ids = batch_item["input_ids"]
                 posterior_input_ids = input_ids
@@ -1332,14 +1422,15 @@ class TestGroundForVAE(TestGroundBase):
                 )
                 # [batch_size, dim_z]
                 posterior_mean, posterior_logvar = self.model.latent_encoder(
-                    posterior_input_ids = posterior_input_ids.to(self.device),
-                    posterior_attention_mask = posterior_attention_mask.to(self.device),
+                    posterior_input_ids=posterior_input_ids.to(self.device),
+                    posterior_attention_mask=posterior_attention_mask.to(self.device),
                 )
                 # [batch_size, dim_z, n_samples]
                 zs = sampling(posterior_mean, posterior_logvar, n_samples)
 
                 # KL(q(z|x,y)||p(z|x))
-                kl = 0.5 * (posterior_mean.pow(2) + posterior_logvar.exp() - posterior_logvar - 1).sum(dim=1).mean(dim=0)
+                kl = 0.5 * (posterior_mean.pow(2) + posterior_logvar.exp() - posterior_logvar - 1).sum(dim=1).mean(
+                    dim=0)
 
                 # MI(y,z;q) =
                 # E_{y \sim LLM(y|x)} E_{z \sim q(z|x,y)} [\log{q(y,z|x)} - \log{q(y|x)} - \log{q(z|x)}]
@@ -1347,17 +1438,21 @@ class TestGroundForVAE(TestGroundBase):
                 # joint_mi
                 log_q_yz_x = log_pdf(posterior_mean, posterior_logvar, zs).sum(dim=1) - np.log(dataset.total_many)
                 log_q_y_x = - np.log(dataset.total_many)
-                log_q_z_x = exp_mean_log(log_pdf(posterior_mean[None, :, :], posterior_logvar[None, :, :], zs[:, None, :, :]).sum(dim=2), dim=1)
+                log_q_z_x = exp_mean_log(
+                    log_pdf(posterior_mean[None, :, :], posterior_logvar[None, :, :], zs[:, None, :, :]).sum(dim=2),
+                    dim=1)
                 joint_mi = (log_q_yz_x - log_q_y_x - log_q_z_x).mean(dim=0).mean(dim=-1)
 
                 log_q_yz_x = log_pdf(posterior_mean, posterior_logvar, zs) - np.log(dataset.total_many)
                 log_q_y_x = - np.log(dataset.total_many)
-                log_q_z_x = exp_mean_log(log_pdf(posterior_mean[None, :, :], posterior_logvar[None, :, :], zs[:, None, :, :]), dim=1)
+                log_q_z_x = exp_mean_log(
+                    log_pdf(posterior_mean[None, :, :], posterior_logvar[None, :, :], zs[:, None, :, :]), dim=1)
                 marginal_mi = (log_q_yz_x - log_q_y_x - log_q_z_x).sum(dim=1).mean(dim=0).mean(dim=-1)
 
                 # AU and CU
                 au = [(torch.var(posterior_mean, dim=0) > thresh).sum().item() for thresh in au_thresh]
-                marginal_kl = (log_q_z_x - log_pdf(torch.zeros_like(posterior_mean), torch.zeros_like(posterior_logvar), zs)).mean(dim=-1).mean(dim=0)
+                marginal_kl = (log_q_z_x - log_pdf(torch.zeros_like(posterior_mean), torch.zeros_like(posterior_logvar),
+                                                   zs)).mean(dim=-1).mean(dim=0)
                 cu = [(marginal_kl < thresh).sum().item() for thresh in cu_thresh]
 
                 results.append({
@@ -1388,13 +1483,14 @@ class TestGroundForVAE(TestGroundBase):
         return results
 
     def test_prior_inference(self):
-        cache_file = os.path.join(self.args.cvae_model_path, ("small_" if args.small_test else "") + f"test_prior_greedy_inference_{version}.json")
+        cache_file = os.path.join(self.args.cvae_model_path,
+                                  ("small_" if args.small_test else "") + f"test_prior_greedy_inference_{version}.json")
         if os.path.exists(cache_file) and not args.erase:
             with open(cache_file, "r", encoding='utf-8') as f:
                 results = json.loads(f.read())
         else:
-            if os.path.exists(cache_file+".cache") and not args.erase:
-                with open(cache_file+".cache", "r", encoding='utf-8') as f:
+            if os.path.exists(cache_file + ".cache") and not args.erase:
+                with open(cache_file + ".cache", "r", encoding='utf-8') as f:
                     cached_results = json.loads(f.read())
             else:
                 cached_results = {}
@@ -1407,7 +1503,7 @@ class TestGroundForVAE(TestGroundBase):
             generation_config = {
                 "num_return_sequences": 1,
                 "do_sample": False,
-                #"temperature": self.args.temperature,
+                # "temperature": self.args.temperature,
                 "latent_sampling": True,
                 "max_new_tokens": dataset.max_output_length,
                 "min_new_tokens": 2,
@@ -1420,7 +1516,7 @@ class TestGroundForVAE(TestGroundBase):
                 references = dataset.one2many_inference[index]["responses"]
                 if str(index) in cached_results:
                     result: dict = cached_results[str(index)]
-                    if not all([result.get(k, None)==v for k,v in {
+                    if not all([result.get(k, None) == v for k, v in {
                         "prompt": prompt,
                         "reference": reference,
                         "references": references
@@ -1437,52 +1533,53 @@ class TestGroundForVAE(TestGroundBase):
                             **inputs,
                             **generation_config,
                         )
-                    responses = dataset.tokenizer.batch_decode(response_ids[:, prompt_length:], skip_special_tokens=False)
+                    responses = dataset.tokenizer.batch_decode(response_ids[:, prompt_length:],
+                                                               skip_special_tokens=False)
                     cut_tail_after = lambda string, eos: string if eos not in string else string[:string.index(eos)]
                     responses = [cut_tail_after(response, dataset.tokenizer.eos_token) for response in responses]
                     responses = [cut_tail_after(response, eot_token) for response in responses]
-                    responses = ["." if len(response)==0 else response for response in responses]
+                    responses = ["." if len(response) == 0 else response for response in responses]
                     references = [cut_tail_after(reference, dataset.tokenizer.eos_token) for reference in references]
                     references = [cut_tail_after(reference, eot_token) for reference in references]
-                    #mauve_score, _ = compute_mauve(responses, references, n_clusters=8)
-                    #distinct = compute_distinct(responses=responses)
-                    #bleu = compute_bleu(responses=responses, references=[references for _ in responses])
-                    #rouge = compute_rouge(responses=responses, references=[references for _ in responses])
-                    #selfbleu = compute_self_bleu(responses=responses)
+                    # mauve_score, _ = compute_mauve(responses, references, n_clusters=8)
+                    # distinct = compute_distinct(responses=responses)
+                    # bleu = compute_bleu(responses=responses, references=[references for _ in responses])
+                    # rouge = compute_rouge(responses=responses, references=[references for _ in responses])
+                    # selfbleu = compute_self_bleu(responses=responses)
                     result = {
                         "prompt": prompt,
                         "reference": reference,
                         "references": references,
                         "responses": responses,
-                        #"mauve_score": mauve_score,
-                        #"distinct": distinct,
-                        #"bleu": bleu,
-                        #"rouge": rouge,
-                        #"selfbleu": selfbleu,
+                        # "mauve_score": mauve_score,
+                        # "distinct": distinct,
+                        # "bleu": bleu,
+                        # "rouge": rouge,
+                        # "selfbleu": selfbleu,
                     }
                 results[index] = result
-                if len(results) % (len(indexes)//10) == 0:
-                    with open(cache_file+".cache", "w", encoding='utf-8') as f:
+                if len(results) % (len(indexes) // 10) == 0:
+                    with open(cache_file + ".cache", "w", encoding='utf-8') as f:
                         f.write(json.dumps(results, ensure_ascii=False, indent=4))
             with open(cache_file, "w", encoding='utf-8') as f:
                 f.write(json.dumps(results, ensure_ascii=False, indent=4))
         results = list(results.values())
-        #mauve_score = np.mean([result["mauve_score"] for result in results])
-        #distinct = {k:np.mean([result["distinct"][k] for result in results])
+        # mauve_score = np.mean([result["mauve_score"] for result in results])
+        # distinct = {k:np.mean([result["distinct"][k] for result in results])
         #            for k in ['distinct-1', 'distinct-2', 'distinct-3', 'distinct-4']}
-        #bleu = {k:np.mean([result["bleu"][k] for result in results])
+        # bleu = {k:np.mean([result["bleu"][k] for result in results])
         #        for k in ['bleu-1', 'bleu-2', 'bleu-3', 'bleu-4']}
-        #rouge = {k:np.mean([result["rouge"][k] for result in results])
+        # rouge = {k:np.mean([result["rouge"][k] for result in results])
         #         for k in ['rouge1', 'rouge2', 'rougeL', 'rougeLsum']}
-        #selfbleu = {k:np.mean([result["selfbleu"][k] for result in results])
+        # selfbleu = {k:np.mean([result["selfbleu"][k] for result in results])
         #             for k in ['bleu-1', 'bleu-2', 'bleu-3', 'bleu-4']}
-        
+
         # update in v6.2
         # re-compute rouge scores
-        #rouge = compute_rouge_mp(
+        # rouge = compute_rouge_mp(
         #    responses = ["\n".join(result["responses"]) for result in results],
         #    references = ["\n".join(result["references"]) for result in results],
-        #)
+        # )
 
         mauve_score = np.mean(compute_mauve_for_results(results))
         rouge = compute_group_rouge_for_results(results)
@@ -1491,7 +1588,7 @@ class TestGroundForVAE(TestGroundBase):
         results = {
             "mauve_score": mauve_score,
             "distinct": distinct,
-            #"bleu": bleu,
+            # "bleu": bleu,
             "selfbleu": selfbleu,
             "rouge": rouge,
         }
@@ -1499,13 +1596,14 @@ class TestGroundForVAE(TestGroundBase):
 
     def test_prior_inference_with_different_temperature(self):
         temperatures = [0.1, 0.4, 0.7, 1.0]
-        cache_file = os.path.join(self.args.cvae_model_path, ("small_" if args.small_test else "") + f"test_prior_temperature_inference_{version}.json")
+        cache_file = os.path.join(self.args.cvae_model_path, (
+            "small_" if args.small_test else "") + f"test_prior_temperature_inference_{version}.json")
         if os.path.exists(cache_file) and not args.erase:
             with open(cache_file, "r", encoding='utf-8') as f:
                 results = json.loads(f.read())
         else:
-            if os.path.exists(cache_file+".cache") and not args.erase:
-                with open(cache_file+".cache", "r", encoding='utf-8') as f:
+            if os.path.exists(cache_file + ".cache") and not args.erase:
+                with open(cache_file + ".cache", "r", encoding='utf-8') as f:
                     cached_results = json.loads(f.read())
             else:
                 cached_results = {}
@@ -1526,7 +1624,7 @@ class TestGroundForVAE(TestGroundBase):
             cut_tail_after = lambda string, eos: string if eos not in string else string[:string.index(eos)]
             indexes = range(0, len(dataset), 10 if args.small_test else 1)
             for temperature in temperatures:
-                temperature_repr = f"{int(temperature*10):02d}"
+                temperature_repr = f"{int(temperature * 10):02d}"
                 results[temperature_repr] = {}
                 for index in tqdm(indexes, desc=f"test_prior_temperature_inference_{temperature_repr}"):
                     prompt = dataset.one2many_inference[index]["prompt"]
@@ -1553,34 +1651,39 @@ class TestGroundForVAE(TestGroundBase):
                                 **generation_config,
                                 temperature=temperature,
                             )
-                        responses = dataset.tokenizer.batch_decode(response_ids[:, prompt_length:], skip_special_tokens=False)
+                        responses = dataset.tokenizer.batch_decode(response_ids[:, prompt_length:],
+                                                                   skip_special_tokens=False)
                         responses = [cut_tail_after(response, dataset.tokenizer.eos_token) for response in responses]
                         responses = [cut_tail_after(response, eot_token) for response in responses]
-                        responses = ["." if len(response)==0 else response for response in responses]
+                        responses = ["." if len(response) == 0 else response for response in responses]
                         result["responses"] = responses
                     results[temperature_repr][index] = result
-                with open(cache_file+".cache", "w", encoding='utf-8') as f:
+                with open(cache_file + ".cache", "w", encoding='utf-8') as f:
                     f.write(json.dumps(results, ensure_ascii=False, indent=4))
             with open(cache_file, "w", encoding='utf-8') as f:
                 f.write(json.dumps(results, ensure_ascii=False, indent=4))
 
         results["final_result"] = {
-            "mauve": [np.mean(compute_mauve_for_results(results[f"{int(temperature*10):02d}"].values())) for temperature in temperatures],
-            "rougeL": [compute_group_rouge_for_results(results[f"{int(temperature*10):02d}"].values())["rougeLsum"] for temperature in temperatures],
-            "distinct": [compute_distinct_for_results(results[f"{int(temperature*10):02d}"].values())["distinct-4"] for temperature in temperatures],
-            "selfbleu": [compute_selfbleu_for_results(results[f"{int(temperature*10):02d}"].values())["bleu-4"] for temperature in temperatures],
+            "mauve": [np.mean(compute_mauve_for_results(results[f"{int(temperature * 10):02d}"].values())) for
+                      temperature in temperatures],
+            "rougeL": [compute_group_rouge_for_results(results[f"{int(temperature * 10):02d}"].values())["rougeLsum"]
+                       for temperature in temperatures],
+            "distinct": [compute_distinct_for_results(results[f"{int(temperature * 10):02d}"].values())["distinct-4"]
+                         for temperature in temperatures],
+            "selfbleu": [compute_selfbleu_for_results(results[f"{int(temperature * 10):02d}"].values())["bleu-4"] for
+                         temperature in temperatures],
         }
         return results
 
-
     def test_posterior_inference(self):
-        cache_file = os.path.join(self.args.cvae_model_path, ("small_" if args.small_test else "") + f"test_posterior_greedy_inference_{version}.json")
+        cache_file = os.path.join(self.args.cvae_model_path, (
+            "small_" if args.small_test else "") + f"test_posterior_greedy_inference_{version}.json")
         if os.path.exists(cache_file) and not args.erase:
             with open(cache_file, "r", encoding='utf-8') as f:
                 results = json.loads(f.read())
         else:
-            if os.path.exists(cache_file+".cache") and not args.erase:
-                with open(cache_file+".cache", "r", encoding='utf-8') as f:
+            if os.path.exists(cache_file + ".cache") and not args.erase:
+                with open(cache_file + ".cache", "r", encoding='utf-8') as f:
                     cached_results = json.loads(f.read())
             else:
                 cached_results = {}
@@ -1593,7 +1696,7 @@ class TestGroundForVAE(TestGroundBase):
             generation_config = {
                 "num_return_sequences": 1,
                 "do_sample": False,
-                #"temperature": self.args.temperature,
+                # "temperature": self.args.temperature,
                 "latent_sampling": False,
                 "max_new_tokens": dataset.max_output_length,
                 "min_new_tokens": 2,
@@ -1606,7 +1709,7 @@ class TestGroundForVAE(TestGroundBase):
                 references = dataset.one2many_inference[index]["responses"]
                 if str(index) in cached_results:
                     result: dict = cached_results[str(index)]
-                    if not all([result.get(k, None)==v for k,v in {
+                    if not all([result.get(k, None) == v for k, v in {
                         "prompt": prompt,
                         "reference": reference,
                         "references": references
@@ -1629,48 +1732,49 @@ class TestGroundForVAE(TestGroundBase):
                             **inputs,
                             **generation_config,
                         )
-                    responses = dataset.tokenizer.batch_decode(response_ids[:, prompt_length:], skip_special_tokens=False)
+                    responses = dataset.tokenizer.batch_decode(response_ids[:, prompt_length:],
+                                                               skip_special_tokens=False)
                     cut_tail_after = lambda string, eos: string if eos not in string else string[:string.index(eos)]
                     responses = [cut_tail_after(response, dataset.tokenizer.eos_token) for response in responses]
                     responses = [cut_tail_after(response, eot_token) for response in responses]
-                    responses = ["." if len(response)==0 else response for response in responses]
+                    responses = ["." if len(response) == 0 else response for response in responses]
                     references = [cut_tail_after(reference, dataset.tokenizer.eos_token) for reference in references]
                     references = [cut_tail_after(reference, eot_token) for reference in references]
-                    #mauve_score, _ = compute_mauve(responses, references, n_clusters=8)
-                    #distinct = compute_distinct(responses=responses)
-                    #bleu = compute_bleu(responses=responses, references=[[reference] for reference in references])
-                    #rouge = compute_rouge(responses=responses, references=[[reference] for reference in references])
-                    #debertascore = compute_debertascore(responses=responses, references=[[reference] for reference in references])
-                    #selfbleu = compute_self_bleu(responses=responses)
+                    # mauve_score, _ = compute_mauve(responses, references, n_clusters=8)
+                    # distinct = compute_distinct(responses=responses)
+                    # bleu = compute_bleu(responses=responses, references=[[reference] for reference in references])
+                    # rouge = compute_rouge(responses=responses, references=[[reference] for reference in references])
+                    # debertascore = compute_debertascore(responses=responses, references=[[reference] for reference in references])
+                    # selfbleu = compute_self_bleu(responses=responses)
                     result = {
                         "prompt": prompt,
                         "reference": reference,
                         "references": references,
                         "responses": responses,
-                        #"mauve_score": mauve_score,
-                        #"distinct": distinct,
-                        #"bleu": bleu,
-                        #"rouge": rouge,
-                        #"debertascore": debertascore,
-                        #"selfbleu": selfbleu
+                        # "mauve_score": mauve_score,
+                        # "distinct": distinct,
+                        # "bleu": bleu,
+                        # "rouge": rouge,
+                        # "debertascore": debertascore,
+                        # "selfbleu": selfbleu
                     }
                 results[index] = result
-                if index % (len(indexes)//10) == 0:
-                    with open(cache_file+".cache", "w", encoding='utf-8') as f:
+                if index % (len(indexes) // 10) == 0:
+                    with open(cache_file + ".cache", "w", encoding='utf-8') as f:
                         f.write(json.dumps(results, ensure_ascii=False, indent=4))
             with open(cache_file, "w", encoding='utf-8') as f:
                 f.write(json.dumps(results, ensure_ascii=False, indent=4))
         results = list(results.values())
-        #mauve_score = np.mean([result["mauve_score"] for result in results])
-        #distinct = {k:np.mean([result["distinct"][k] for result in results])
+        # mauve_score = np.mean([result["mauve_score"] for result in results])
+        # distinct = {k:np.mean([result["distinct"][k] for result in results])
         #            for k in ['distinct-1', 'distinct-2', 'distinct-3', 'distinct-4']}
-        #bleu = {k:np.mean([result["bleu"][k] for result in results])
+        # bleu = {k:np.mean([result["bleu"][k] for result in results])
         #        for k in ['bleu-1', 'bleu-2', 'bleu-3', 'bleu-4']}
-        #rouge = {k:np.mean([result["rouge"][k] for result in results])
+        # rouge = {k:np.mean([result["rouge"][k] for result in results])
         #         for k in ['rouge1', 'rouge2', 'rougeL', 'rougeLsum']}
-        #debertascore = {k:np.mean([result["debertascore"][k] for result in results])
+        # debertascore = {k:np.mean([result["debertascore"][k] for result in results])
         #         for k in ['precision', 'recall', 'f1']}
-        #selfbleu = {k:np.mean([result["selfbleu"][k] for result in results])
+        # selfbleu = {k:np.mean([result["selfbleu"][k] for result in results])
         #             for k in ['bleu-1', 'bleu-2', 'bleu-3', 'bleu-4']}
 
         mauve_score = np.mean(compute_mauve_for_results(results))
@@ -1680,41 +1784,42 @@ class TestGroundForVAE(TestGroundBase):
         results = {
             "mauve_score": mauve_score,
             "distinct": distinct,
-            #"bleu": bleu,
+            # "bleu": bleu,
             "rouge": rouge,
-            #"debertascore": debertascore,
+            # "debertascore": debertascore,
             "selfbleu": selfbleu,
         }
         return results
 
-
     def get_posterior_latent_and_probs(self, usage="validation", num_shots="all"):
-        cache_file = os.path.join(self.args.cvae_model_path, ("small_" if args.small_test else "") + f"get_posterior_latent_and_probs_{usage}_{num_shots}_{version}.json")
+        cache_file = os.path.join(self.args.cvae_model_path, (
+            "small_" if args.small_test else "") + f"get_posterior_latent_and_probs_{usage}_{num_shots}_{version}.json")
         if os.path.exists(cache_file) and not args.erase:
             with open(cache_file, "r", encoding='utf-8') as f:
                 results = json.loads(f.read())
         else:
-            if os.path.exists(cache_file+".cache") and not args.erase:
-                with open(cache_file+".cache", "r", encoding='utf-8') as f:
+            if os.path.exists(cache_file + ".cache") and not args.erase:
+                with open(cache_file + ".cache", "r", encoding='utf-8') as f:
                     cached_results = json.loads(f.read())
             else:
                 cached_results = {}
             self.load_model()
-            dataset = ComparisonDataset(tokenizer_path=args.base_model_name, dataset_name=args.dataset_name, usage=usage)
+            dataset = ComparisonDataset(tokenizer_path=args.base_model_name, dataset_name=args.dataset_name,
+                                        usage=usage)
             results = {}
             if num_shots == "all":
                 indexes = range(len(dataset.one2many_inference_with_logits))
             elif num_shots == "active_100":
                 dataset.compute_index_label_mutual_information()
-                indexes = [(mi,index) for index,mi in enumerate(dataset.index_label_mi)]
-                indexes = [index for mi,index in sorted(indexes)[-100:]]
+                indexes = [(mi, index) for index, mi in enumerate(dataset.index_label_mi)]
+                indexes = [index for mi, index in sorted(indexes)[-100:]]
             elif num_shots == "active_10":
                 dataset.compute_index_label_mutual_information()
-                indexes = [(mi,index) for index,mi in enumerate(dataset.index_label_mi)]
-                indexes = [index for mi,index in sorted(indexes)[-10:]]
+                indexes = [(mi, index) for index, mi in enumerate(dataset.index_label_mi)]
+                indexes = [index for mi, index in sorted(indexes)[-10:]]
             else:
                 indexes = list(range(0, len(dataset.one2many_inference_with_logits),
-                                     len(dataset.one2many_inference_with_logits)//int(num_shots)))[:int(num_shots)]
+                                     len(dataset.one2many_inference_with_logits) // int(num_shots)))[:int(num_shots)]
             for index in tqdm(indexes):
                 data = dataset.one2many_inference_with_logits[index]
                 prompt = data["prompt"]
@@ -1722,7 +1827,7 @@ class TestGroundForVAE(TestGroundBase):
 
                 if str(index) in cached_results:
                     result: dict = cached_results[str(index)]
-                    if not all([result.get(k, None)==v for k,v in {
+                    if not all([result.get(k, None) == v for k, v in {
                         "prompt": prompt,
                         "responses": responses,
                     }.items()]):
@@ -1778,64 +1883,12 @@ class TestGroundForVAE(TestGroundBase):
                         "posterior_logvar": round_tensor(posterior_logvar),
                     }
                 results[index] = result
-                if index % (len(indexes)//10) == 0:
-                    with open(cache_file+".cache", "w", encoding='utf-8') as f:
+                if index % (len(indexes) // 10) == 0:
+                    with open(cache_file + ".cache", "w", encoding='utf-8') as f:
                         f.write(json.dumps(results, ensure_ascii=False, indent=4))
             with open(cache_file, "w", encoding='utf-8') as f:
                 f.write(json.dumps(results, ensure_ascii=False, indent=4))
         return results
-
-    def test_latent_acc(self, num_valid_shots="all"):
-        valid_posterior_latent_and_logits = self.get_posterior_latent_and_probs(usage="validation", num_shots=num_valid_shots)
-        test_posterior_latent_and_logits = self.get_posterior_latent_and_probs(usage="test", num_shots="all")
-        all_relative_probs = []
-        for result in valid_posterior_latent_and_logits.values():
-            logits = torch.Tensor(result["logits"]).cuda()
-            average_logits = logits.mean(dim=0, keepdim=True)
-            relative_logits = logits - average_logits
-            relative_probs = F.softmax(relative_logits, dim=1)
-            all_relative_probs.append(relative_probs)
-        all_valid_probs = torch.cat(all_relative_probs, dim=0)
-        #all_valid_probs = torch.FloatTensor(sum([result["probs"] for result in valid_posterior_latent_and_logits.values()], start=[])).cuda()
-        #all_valid_preds = all_valid_probs.argmax(dim=1)
-        all_valid_posterior_mean = torch.FloatTensor(sum([result["posterior_mean"] for result in valid_posterior_latent_and_logits.values()], start=[])).cuda()
-        all_valid_posterior_logvar = torch.FloatTensor(sum([result["posterior_logvar"] for result in valid_posterior_latent_and_logits.values()], start=[])).cuda()
-        print(f"valid label shape: {all_valid_probs.shape}")
-        print(f"valid latent shape: {all_valid_posterior_mean.shape}")
-
-        latent_classifier = torch.nn.Sequential(
-            torch.nn.Linear(all_valid_posterior_mean.shape[1], 1024),
-            torch.nn.GELU(),
-            torch.nn.Linear(1024, all_valid_probs.shape[1])
-        ).cuda()
-        optimizer = torch.optim.AdamW(latent_classifier.parameters(), lr=1e-3)
-        bar = tqdm(range(1000), desc="training latent classifier")
-        for epoch in bar:
-            #zs = sampling(all_valid_posterior_mean, all_valid_posterior_logvar, 1).squeeze(-1)
-            zs = all_valid_posterior_mean
-            preds = F.softmax(latent_classifier(zs), dim=-1)
-            loss = -((all_valid_probs+1e-5) * (preds+1e-5).log()).sum(dim=1).mean(dim=0)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            bar.set_description(f"training latent classifier: loss = {loss.item():.3f}")
-        latent_classifier.eval()
-
-        n_correct_rt = 0
-        n_correct_cls = 0
-        n_total = 0
-        for result in tqdm(test_posterior_latent_and_logits.values(), desc="testing latent classifier"):
-            probs = torch.FloatTensor(result["probs"]).cuda()
-            posterior_mean = torch.FloatTensor(result["posterior_mean"]).cuda()
-            posterior_logvar = torch.FloatTensor(result["posterior_logvar"]).cuda()
-            with torch.no_grad():
-                preds = F.softmax(latent_classifier(posterior_mean), dim=-1)
-            preds_comparison = preds[:, None, :] > preds[None, :, :]
-            label_comparison = probs[:, None, :] > probs[None, :, :]
-            n_correct_cls += preds_comparison.eq(label_comparison).float().sum() - probs.shape[0] * probs.shape[1]
-            n_total += probs.shape[0] * (probs.shape[0] - 1) * probs.shape[1]
-
-        print(f"latent acc: {n_correct_cls} / {n_total} = {n_correct_cls/n_total*100:.2f}%")
 
     def test_latent_guided_generation(self, num_valid_shots="10", num_test_shots="active_100"):
         cache_file = os.path.join(self.args.cvae_model_path, (
@@ -1845,37 +1898,28 @@ class TestGroundForVAE(TestGroundBase):
             with open(cache_file, "r", encoding='utf-8') as f:
                 results = json.loads(f.read())
         else:
+            # Step 1. Validation Cases
             valid_posterior_latent_and_logits = self.get_posterior_latent_and_probs(usage="validation", num_shots=num_valid_shots)
             test_posterior_latent_and_logits = self.get_posterior_latent_and_probs(usage="test", num_shots=num_test_shots)
-            all_valid_logits = torch.FloatTensor(sum([result["logits"] for result in valid_posterior_latent_and_logits.values()], start=[])).cuda()
-            all_valid_probs = torch.FloatTensor(sum([result["probs"] for result in valid_posterior_latent_and_logits.values()], start=[])).cuda()
-            all_valid_preds = all_valid_probs.argmax(dim=1)
-            all_valid_posterior_mean = torch.FloatTensor(sum([result["posterior_mean"] for result in valid_posterior_latent_and_logits.values()], start=[])).cuda()
-            all_valid_posterior_logvar = torch.FloatTensor(sum([result["posterior_logvar"] for result in valid_posterior_latent_and_logits.values()], start=[])).cuda()
-            print(f"valid label shape: {all_valid_probs.shape}")
-            print(f"valid latent shape: {all_valid_posterior_mean.shape}")
 
+            # Step 2. Latent Vector Encoding
             all_corrcoef = []
             for posterior_result in valid_posterior_latent_and_logits.values():
-                # all_valid_logits: [batch_size, num_labels]
-                # all_valid_posterior_mean: [batch_size, dim_z]
-                logits = torch.FloatTensor(posterior_result["logits"])
-                mean = torch.FloatTensor(posterior_result["posterior_mean"])
-                dim_z = mean.shape[1]
-                #inputs = torch.cat([logits, mean], dim=1).T
+                logits = torch.FloatTensor(posterior_result["logits"]) # response labels - [batch_size, num_labels]
+                mean = torch.FloatTensor(posterior_result["posterior_mean"]) # latent vectors - [batch_size, dim_z]
                 inputs = torch.cat([F.softmax(logits, dim=1), mean], dim=1).T
                 corrcoef = torch.corrcoef(inputs)
-                assert corrcoef.shape == (num_labels+dim_z, num_labels+dim_z), corrcoef.shape
-                all_corrcoef.append(corrcoef[:num_labels, -dim_z:])
+                dim_z = mean.shape[1]
+                assert corrcoef.shape == (num_labels + dim_z, num_labels + dim_z), corrcoef.shape
+                all_corrcoef.append(corrcoef[:num_labels, -dim_z:]) # Pearson correlation coefficient between response labels and latent dimensions
             all_corrcoef = torch.stack(all_corrcoef, dim=0)
             all_corrcoef = torch.where(torch.isnan(all_corrcoef), 0.0, all_corrcoef)
             avg_corrcoef = all_corrcoef.mean(dim=0)
-            print(f"avg_corrcoef:\n{avg_corrcoef}")
-
             unbiased_corrcoef = avg_corrcoef - avg_corrcoef.mean(dim=0, keepdim=True)
             normalized_corrcoef = unbiased_corrcoef / unbiased_corrcoef.pow(2).sum(dim=-1, keepdim=True).sqrt()
             print(f"normalized_corrcoef:\n{normalized_corrcoef}")
 
+            # Step 3. Latent Vector Normalizing and Decoding & Evaluation
             self.load_model()
             dataset = One2ManyDataset(
                 tokenizer_path=self.args.base_model_name,
@@ -1891,7 +1935,8 @@ class TestGroundForVAE(TestGroundBase):
             }
             cut_tail_after = lambda string, eos: string if eos not in string else string[:string.index(eos)]
             results = []
-            for posterior_result in tqdm(list(test_posterior_latent_and_logits.values()), desc="performing manipulated generation"):
+            for posterior_result in tqdm(list(test_posterior_latent_and_logits.values()),
+                                         desc="performing manipulated generation"):
                 prompt = posterior_result["prompt"]
                 references = posterior_result["responses"]
                 references = [cut_tail_after(response, dataset.tokenizer.eos_token) for response in references]
@@ -1902,23 +1947,19 @@ class TestGroundForVAE(TestGroundBase):
                 references_posterior_logvar = torch.zeros_like(references_posterior_mean).fill_(-100)
 
                 inputs = dataset.tokenizer([prompt], return_tensors="pt")
-                inputs = {k: v.repeat(32,1).cuda() for k, v in inputs.items()}
+                inputs = {k: v.repeat(32, 1).cuda() for k, v in inputs.items()}
                 prompt_length = inputs["input_ids"].shape[1]
 
-                inputs["latent_mean_logvar"] = (
-                    references_posterior_mean.cuda(),
-                    references_posterior_logvar.cuda(),
-                )
+                inputs["latent_mean_logvar"] = (references_posterior_mean.cuda(), references_posterior_logvar.cuda())
                 with torch.no_grad():
-                    response_ids = self.model.generate(
-                        **inputs,
-                        **generation_config,
-                    )
+                    response_ids = self.model.generate(**inputs, **generation_config)
                 reconstructed_responses = dataset.tokenizer.batch_decode(response_ids[:, prompt_length:], skip_special_tokens=False)
                 reconstructed_responses = [cut_tail_after(response, dataset.tokenizer.eos_token) for response in reconstructed_responses]
                 reconstructed_responses = [cut_tail_after(response, eot_token) for response in reconstructed_responses]
                 reconstructed_rouge = compute_rouge(responses=reconstructed_responses, references=[references for _ in reconstructed_responses])
-                reconstructed_debertascore = compute_debertascore(responses=reconstructed_responses, references=[references for _ in reconstructed_responses])
+                reconstructed_debertascore = compute_debertascore(responses=reconstructed_responses,
+                                                                  references=[references for _ in
+                                                                              reconstructed_responses])
                 reconstructed_logits = self.test_logits(prompt, reconstructed_responses)
                 reconstructed_probs = F.softmax(reconstructed_logits, dim=-1)
                 result = {
@@ -1942,9 +1983,12 @@ class TestGroundForVAE(TestGroundBase):
                                 **inputs,
                                 **generation_config,
                             )
-                        manipulated_responses = dataset.tokenizer.batch_decode(response_ids[:, prompt_length:], skip_special_tokens=False)
-                        manipulated_responses = [cut_tail_after(response, dataset.tokenizer.eos_token) for response in manipulated_responses]
-                        manipulated_responses = [cut_tail_after(response, eot_token) for response in manipulated_responses]
+                        manipulated_responses = dataset.tokenizer.batch_decode(response_ids[:, prompt_length:],
+                                                                               skip_special_tokens=False)
+                        manipulated_responses = [cut_tail_after(response, dataset.tokenizer.eos_token) for response in
+                                                 manipulated_responses]
+                        manipulated_responses = [cut_tail_after(response, eot_token) for response in
+                                                 manipulated_responses]
                         manipulated_logits = self.test_logits(prompt, manipulated_responses)
                         manipulated_probs = F.softmax(manipulated_logits, dim=1)
                         result[f"manipulated_responses-{index_feature}@{k}"] = manipulated_responses
@@ -1957,8 +2001,10 @@ class TestGroundForVAE(TestGroundBase):
                             references=[references for _ in manipulated_responses]
                         )
                         result[f"manipulated_probs-{index_feature}@{k}"] = round_tensor(manipulated_probs)
-                        result[f"manipulated_win_rate-{index_feature}@{k}"] = round_tensor((manipulated_probs > reconstructed_probs).float().mean(dim=0))
-                        result[f"manipulated_probs_delta-{index_feature}@{k}"] = round_tensor((manipulated_probs - reconstructed_probs).mean(dim=0))
+                        result[f"manipulated_win_rate-{index_feature}@{k}"] = round_tensor(
+                            (manipulated_probs > reconstructed_probs).float().mean(dim=0))
+                        result[f"manipulated_probs_delta-{index_feature}@{k}"] = round_tensor(
+                            (manipulated_probs - reconstructed_probs).mean(dim=0))
                 results.append(result)
 
             for index_feature in range(num_labels):
@@ -1977,7 +2023,8 @@ class TestGroundForVAE(TestGroundBase):
                 f.write(json.dumps(results, ensure_ascii=False, indent=4))
         references_probs = torch.Tensor([result[f"references_probs"] for result in results]).mean(dim=1).mean(dim=0)
         print(f"references_probs:\n{references_probs}")
-        reconstructed_probs = torch.Tensor([result[f"reconstructed_probs"] for result in results]).mean(dim=1).mean(dim=0)
+        reconstructed_probs = torch.Tensor([result[f"reconstructed_probs"] for result in results]).mean(dim=1).mean(
+            dim=0)
         print(f"reconstructed_probs:\n{reconstructed_probs}")
         for index_feature in range(num_labels):
             print(f"feature-{index_feature}:")
@@ -2014,192 +2061,18 @@ class TestGroundForVAE(TestGroundBase):
 
         return results
 
-    def test_most_likely_latent_guided_generation(self, num_valid_shots="active_10", num_test_shots="active_100"):
-        cache_file = os.path.join(self.args.cvae_model_path, (
-            "small_" if args.small_test else "") + f"test_most_likely_latent_guided_generation_{num_valid_shots}_{num_test_shots}_{version}.json")
-        num_labels = len(get_dataset_indexed_labels(self.args.dataset_name))
-        if os.path.exists(cache_file) and not self.args.erase and False:
-            with open(cache_file, "r", encoding='utf-8') as f:
-                results = json.loads(f.read())
-        else:
-            valid_posterior_latent_and_logits = self.get_posterior_latent_and_probs(usage="validation",
-                                                                                    num_shots=num_valid_shots)
-            test_posterior_latent_and_logits = self.get_posterior_latent_and_probs(usage="test",
-                                                                                   num_shots=num_test_shots)
-            all_valid_logits = torch.FloatTensor(
-                sum([result["logits"] for result in valid_posterior_latent_and_logits.values()], start=[])).cuda()
-            all_valid_probs = torch.FloatTensor(
-                sum([result["probs"] for result in valid_posterior_latent_and_logits.values()], start=[])).cuda()
-            all_valid_preds = all_valid_probs.argmax(dim=1)
-
-            all_valid_posterior_mean = torch.FloatTensor(
-                sum([result["posterior_mean"] for result in valid_posterior_latent_and_logits.values()],
-                    start=[])).cuda()
-            all_valid_posterior_logvar = torch.FloatTensor(
-                sum([result["posterior_logvar"] for result in valid_posterior_latent_and_logits.values()],
-                    start=[])).cuda()
-            print(f"valid label shape: {all_valid_probs.shape}")
-            print(f"valid latent shape: {all_valid_posterior_mean.shape}")
-
-            most_likely_responses = []
-            most_likely_posterior_mean = []
-            for result in valid_posterior_latent_and_logits.values():
-                responses = result["responses"]
-                posterior_mean = result["posterior_mean"]
-                most_likely_indexes = np.argmax(result["probs"], axis=0).tolist()
-                assert len(most_likely_indexes) == num_labels
-                most_likely_responses.append([responses[i] for i in most_likely_indexes])
-                most_likely_posterior_mean.append([posterior_mean[i] for i in most_likely_indexes])
-            print(f"most_likely_posterior_mean:\n{torch.Tensor(most_likely_posterior_mean)}")
-            most_likely_posterior_mean = torch.Tensor(most_likely_posterior_mean).mean(dim=0)
-            print(f"most_likely_posterior_mean:\n{most_likely_posterior_mean}")
-
-            zs = torch.arange(-2, 2, 0.1).cuda()
-            logp_zs_given_ys = log_pdf(
-                all_valid_posterior_mean[:, None, :],
-                all_valid_posterior_logvar[:, None, :],
-                zs[None, :, None]
-            ) # [N, n, dim_z]
-            logp_zs = exp_mean_log(logp_zs_given_ys, dim=0)
-            log_importance_weights = logp_zs_given_ys - logp_zs[None, :, :]
-            log_probs = all_valid_probs.log()
-            iw_probs = exp_mean_log(log_importance_weights[:, :, :, None] + log_probs[:, None, None, :], dim=0).exp()
-            iw_probs_prior_weighted = iw_probs * log_pdf(torch.zeros_like(zs), torch.zeros_like(zs), zs).exp()[:, None, None]
-
-            for name,data in [
-                ("iw_probs", iw_probs),
-                ("iw_probs_prior_weighted", iw_probs_prior_weighted)
-            ]:
-                import matplotlib.pyplot as plt
-                x = np.arange(-2, 2, 0.1)
-                fig, axs = plt.subplots(4, 8, figsize=(20, 10))
-                axs = axs.flatten()
-                for i in range(all_valid_posterior_mean.shape[1]):
-                    for j in range(num_labels):
-                        axs[i].plot(x, data[:, i, j].cpu().tolist(), label=f'Feature {j + 1}')
-                    axs[i].set_title(f'Dim_z {i + 1}')
-                    axs[i].set_xlabel('X-axis')
-                    axs[i].set_ylabel('Y-axis')
-                    axs[i].legend()
-                plt.tight_layout()
-                plt.savefig(os.path.join(self.args.cvae_model_path, f'{name}.png'))
-                plt.clf()
-
-            max_values = torch.max(iw_probs, dim=0)[0]
-            max_indices = torch.argmax(iw_probs, dim=0)
-            zs = zs[max_indices].T # [n_feature, dim_z]
-            print(f"zs:\n{zs}")
-            print(f"max_values:\n{max_values}")
-
-            self.load_model()
-            dataset = One2ManyDataset(
-                tokenizer_path=self.args.base_model_name,
-                dataset_name=self.args.dataset_name,
-                usage="test", total_many=32, mini_many=32
-            )
-            generation_config = {
-                "num_return_sequences": 1,
-                "do_sample": True,
-                "temperature": self.args.temperature,
-                "max_new_tokens": dataset.max_output_length,
-                "min_new_tokens": 2,
-            }
-            cut_tail_after = lambda string, eos: string if eos not in string else string[:string.index(eos)]
-            results = []
-            for posterior_result in tqdm(list(test_posterior_latent_and_logits.values()),
-                                         desc="performing most likely generation"):
-                prompt = posterior_result["prompt"]
-                references = posterior_result["responses"]
-                references = [cut_tail_after(response, dataset.tokenizer.eos_token) for response in references]
-                references = [cut_tail_after(response, eot_token) for response in references]
-                references_logits = torch.FloatTensor(posterior_result["logits"])
-                references_probs = F.softmax(references_logits, dim=1)
-                references_posterior_mean = torch.FloatTensor(posterior_result["posterior_mean"])
-                references_posterior_logvar = torch.zeros_like(references_posterior_mean).fill_(-100)
-
-                result = {
-                    "prompt": prompt,
-                    "references": references,
-                    "references_probs": round_tensor(references_probs),
-                }
-
-                result["manipulated_references"] = [
-                    references[i] for i in torch.argmax(references_probs, dim=0).tolist()
-                ]
-                assert len(result["manipulated_references"]) == num_labels
-
-                inputs = dataset.tokenizer([prompt], return_tensors="pt")
-                inputs = {k: v.repeat(num_labels, 1).cuda() for k, v in inputs.items()}
-                manipulated_posterior_mean = zs.cuda()
-                manipulated_posterior_logvar = torch.empty_like(manipulated_posterior_mean).fill_(-100)
-                inputs["latent_mean_logvar"] = (manipulated_posterior_mean, manipulated_posterior_logvar)
-
-                with torch.no_grad():
-                    response_ids = self.model.generate(
-                        **inputs,
-                        **generation_config,
-                    )
-                prompt_length = inputs["input_ids"].shape[1]
-                manipulated_responses = dataset.tokenizer.batch_decode(response_ids[:, prompt_length:],
-                                                                       skip_special_tokens=False)
-                manipulated_responses = [cut_tail_after(response, dataset.tokenizer.eos_token) for response in
-                                         manipulated_responses]
-                manipulated_responses = [cut_tail_after(response, eot_token) for response in manipulated_responses]
-                assert len(manipulated_responses) == num_labels
-
-                manipulated_logits = self.test_logits(prompt, manipulated_responses)
-                manipulated_probs = F.softmax(manipulated_logits, dim=1)
-                print(f"manipulated_probs:\n{manipulated_probs}")
-                result[f"manipulated_responses"] = manipulated_responses
-                result[f"manipulated_probs"] = round_tensor(manipulated_probs)
-
-                results.append(result)
-
-            with open(cache_file, "w", encoding='utf-8') as f:
-                f.write(json.dumps(results, ensure_ascii=False, indent=4))
-
-        if "mauve_array" not in results[0]:
-            mauve_array = [
-                [np.nan for _ in range(num_labels)]
-                for __ in range(num_labels)
-            ]
-            bar = tqdm(range(num_labels * num_labels))
-            for index_reference_feature in range(num_labels):
-                manipulated_references = [result["manipulated_references"][index_reference_feature]
-                                          for result in results]
-                for index_manipulated_feature in range(num_labels):
-                    bar.set_description(f"compute mauve between reference-{index_reference_feature}"
-                                        f" and manipulated-{index_manipulated_feature}")
-                    manipulated_responses = [result[f"manipulated_responses"][index_manipulated_feature]
-                                             for result in results]
-                    mauve_array[index_reference_feature][index_manipulated_feature] = \
-                    compute_mauve(manipulated_references, manipulated_responses)[0]
-                    bar.update()
-            mauve_array_trace = np.array(mauve_array).trace()
-            mauve_array_trace_ratio = np.array(mauve_array).trace() / np.array(mauve_array).sum()
-            print(f"mauve_array:\n{np.array(mauve_array)}")
-            print(f"mauve_array_trace:\n{mauve_array_trace}")
-            print(f"mauve_array_trace_ratio: {mauve_array_trace_ratio:.4f}")
-
-            results[0]["mauve_array"] = mauve_array
-            results[0]["mauve_array_trace"] = mauve_array_trace
-            results[0]["mauve_array_trace_ratio"] = mauve_array_trace_ratio
-
-            with open(cache_file, "w", encoding='utf-8') as f:
-                f.write(json.dumps(results, ensure_ascii=False, indent=4))
-        return results
-
     def test_interpolation(self, num_test_shots="all"):
         cache_file = os.path.join(
             self.args.cvae_model_path,
-            ("small_" if args.small_test else "") + f"test_interpolation_{num_test_shots}_{version}_temp{int(self.args.temperature * 10):02d}.json"
+            (
+                "small_" if args.small_test else "") + f"test_interpolation_{num_test_shots}_{version}_temp{int(self.args.temperature * 10):02d}.json"
         )
         if os.path.exists(cache_file) and not self.args.erase and False:
             with open(cache_file, "r", encoding='utf-8') as f:
                 results = json.loads(f.read())
         else:
-            if os.path.exists(cache_file+".cache") and not self.args.erase:
-                with open(cache_file+".cache", "r", encoding='utf-8') as f:
+            if os.path.exists(cache_file + ".cache") and not self.args.erase:
+                with open(cache_file + ".cache", "r", encoding='utf-8') as f:
                     cached_results = json.loads(f.read())
             else:
                 cached_results = []
@@ -2235,11 +2108,11 @@ class TestGroundForVAE(TestGroundBase):
                 z_a = torch.FloatTensor(posterior_result["posterior_mean"])[a, :]
                 z_b = torch.FloatTensor(posterior_result["posterior_mean"])[b, :]
                 lamda = torch.arange(0, 1.01, 0.1)
-                zs_lamda = z_a[None, :] * (1-lamda[:, None]) + z_b[None, :] * lamda[:, None]
+                zs_lamda = z_a[None, :] * (1 - lamda[:, None]) + z_b[None, :] * lamda[:, None]
 
                 logvar_a = torch.FloatTensor(posterior_result["posterior_logvar"])[a, :]
                 logvar_b = torch.FloatTensor(posterior_result["posterior_logvar"])[b, :]
-                logvar_lamda = logvar_a[None, :] * (1-lamda[:, None]) + logvar_b[None, :] * lamda[:, None]
+                logvar_lamda = logvar_a[None, :] * (1 - lamda[:, None]) + logvar_b[None, :] * lamda[:, None]
 
                 if (len(cached_results) > 0
                         and cached_results[0].get("prompt", None) == prompt
@@ -2260,10 +2133,11 @@ class TestGroundForVAE(TestGroundBase):
                         )
                     prompt_length = inputs["input_ids"].shape[1]
                     interpolated_responses = dataset.tokenizer.batch_decode(response_ids[:, prompt_length:],
-                                                                           skip_special_tokens=False)
+                                                                            skip_special_tokens=False)
                     interpolated_responses = [cut_tail_after(response, dataset.tokenizer.eos_token) for response in
-                                             interpolated_responses]
-                    interpolated_responses = [cut_tail_after(response, eot_token) for response in interpolated_responses]
+                                              interpolated_responses]
+                    interpolated_responses = [cut_tail_after(response, eot_token) for response in
+                                              interpolated_responses]
                     assert len(interpolated_responses) == lamda.shape[0]
 
                     result = {
@@ -2276,8 +2150,8 @@ class TestGroundForVAE(TestGroundBase):
                         print("-" * 100)
                         print(json.dumps(result, ensure_ascii=False, indent=4))
                 results.append(result)
-                if len(results) % (len(posterior_results)//10) == 0:
-                    with open(cache_file+".cache", "w", encoding='utf-8') as f:
+                if len(results) % (len(posterior_results) // 10) == 0:
+                    with open(cache_file + ".cache", "w", encoding='utf-8') as f:
                         f.write(json.dumps(results, ensure_ascii=False, indent=4))
             with open(cache_file, "w", encoding='utf-8') as f:
                 f.write(json.dumps(results, ensure_ascii=False, indent=4))
@@ -2290,8 +2164,8 @@ class TestGroundForVAE(TestGroundBase):
             probs = F.softmax(logits, dim=-1)
             probs_a, probs_b = probs[0, :], probs[1, :]
             probs_avg = (probs_a + probs_b) / 2
-            entropy = lambda probs:(probs*probs.log()).sum()
-            jsd = entropy(probs_avg) - entropy(probs_a)/2 - entropy(probs_b)/2
+            entropy = lambda probs: (probs * probs.log()).sum()
+            jsd = entropy(probs_avg) - entropy(probs_a) / 2 - entropy(probs_b) / 2
             result["probs"] = round_tensor(probs)
             result["jsd"] = round(jsd.item(), 3)
 
@@ -2310,7 +2184,6 @@ class TestGroundForVAE(TestGroundBase):
 
         return results
 
-
     def test_yelp_interpolation(self):
         if not self.args.dataset_name == "yelp":
             return None
@@ -2323,8 +2196,8 @@ class TestGroundForVAE(TestGroundBase):
             with open(cache_file, "r", encoding='utf-8') as f:
                 results = json.loads(f.read())
         else:
-            if os.path.exists(cache_file+".cache") and not self.args.erase:
-                with open(cache_file+".cache", "r", encoding='utf-8') as f:
+            if os.path.exists(cache_file + ".cache") and not self.args.erase:
+                with open(cache_file + ".cache", "r", encoding='utf-8') as f:
                     cached_results = json.loads(f.read())
             else:
                 cached_results = []
@@ -2344,10 +2217,11 @@ class TestGroundForVAE(TestGroundBase):
             }
             cut_tail_after = lambda string, eos: string if eos not in string else string[:string.index(eos)]
             results = []
-            test_posterior_latent_and_logits = list(self.get_posterior_latent_and_probs(usage="test", num_shots=num_shots).values())
+            test_posterior_latent_and_logits = list(
+                self.get_posterior_latent_and_probs(usage="test", num_shots=num_shots).values())
             for result in test_posterior_latent_and_logits:
                 probs = np.array(result["probs"])
-                averaged_ratings = (probs * (np.arange(5)+1)).sum(axis=1)
+                averaged_ratings = (probs * (np.arange(5) + 1)).sum(axis=1)
                 if not averaged_ratings.std() > np.linspace(1, 5, 32).std():
                     continue
                 lowest_rated_index = averaged_ratings.argmin()
@@ -2379,7 +2253,8 @@ class TestGroundForVAE(TestGroundBase):
                             **generation_config,
                         )
                     prompt_length = inputs["input_ids"].shape[1]
-                    interpolated_responses = dataset.tokenizer.batch_decode(response_ids[:, prompt_length:], skip_special_tokens=False)
+                    interpolated_responses = dataset.tokenizer.batch_decode(response_ids[:, prompt_length:],
+                                                                            skip_special_tokens=False)
                     interpolated_responses = [cut_tail_after(response, dataset.tokenizer.eos_token)
                                               for response in interpolated_responses]
                     interpolated_responses = [cut_tail_after(response, eot_token)
@@ -2388,7 +2263,7 @@ class TestGroundForVAE(TestGroundBase):
 
                     interpolated_logits = self.test_logits(prompt=prompt, responses=interpolated_responses)
                     interpolated_probs = F.softmax(interpolated_logits, dim=1)
-                    interpolated_ratings = round_tensor((interpolated_probs.numpy() * (np.arange(5)+1)).sum(axis=1))
+                    interpolated_ratings = round_tensor((interpolated_probs.numpy() * (np.arange(5) + 1)).sum(axis=1))
 
                     result = {
                         "prompt": prompt,
@@ -2398,8 +2273,8 @@ class TestGroundForVAE(TestGroundBase):
                         "interpolated_ratings": interpolated_ratings,
                     }
                 results.append(result)
-                if len(results) % (len(test_posterior_latent_and_logits)//10) == 0:
-                    with open(cache_file+".cache", "w", encoding='utf-8') as f:
+                if len(results) % (len(test_posterior_latent_and_logits) // 10) == 0:
+                    with open(cache_file + ".cache", "w", encoding='utf-8') as f:
                         f.write(json.dumps(results, ensure_ascii=False, indent=4))
             with open(cache_file, "w", encoding='utf-8') as f:
                 f.write(json.dumps(results, ensure_ascii=False, indent=4))
@@ -2421,7 +2296,7 @@ class TestGroundForVAE(TestGroundBase):
         plt.xticks(x_ticks)  # 设置横坐标刻度
         plt.legend()
         plt.grid()
-        plt.savefig(cache_file+".png")
+        plt.savefig(cache_file + ".png")
 
     def test_logits(self, prompt, responses):
         if type(responses) is str:
@@ -2506,8 +2381,8 @@ class TestGroundForVAE(TestGroundBase):
 
         cut_tail_after = lambda string, eos: string if eos not in string else string[:string.index(eos)]
         for result in results:
-            assert result["response"].startswith("<|begin_of_text|>"+result["prompt"])
-            result["response"] = result["response"][len("<|begin_of_text|>"+result["prompt"]):]
+            assert result["response"].startswith("<|begin_of_text|>" + result["prompt"])
+            result["response"] = result["response"][len("<|begin_of_text|>" + result["prompt"]):]
             result["response"] = cut_tail_after(result["response"], dataset.tokenizer.eos_token)
             result["response"] = cut_tail_after(result["response"], eot_token)
             result["reference"] = cut_tail_after(result["reference"], eot_token)
@@ -2540,72 +2415,79 @@ class TestGroundForVAE(TestGroundBase):
         print(f"response-overall: {np.mean([scores[key] for scores in all_scores for key in keys]):.3f}")
 
 
-if __name__ == "__main__":
-    parser = get_basic_parser(epochs=2, global_batch_size=16, mini_batch_size=1, learning_rate=1e-5)
-    parser.add_argument('--cvae_model_path', type=get_last_checkpoint_at_root, default=None)
-    parser.add_argument('--num_latent_encoder_layers', type=int, default=2)
-    parser.add_argument('--frozen_pretrained', type=int, default=1)
-    parser.add_argument('--use_standard_prior', type=int, default=1)
-    parser.add_argument('--vae_type', type=str, default="DG-VAE")
-    parser.add_argument('--add_contra_loss', type=int, default=0)
-    parser.add_argument('--add_skip_connection', type=int, default=1)
-    parser.add_argument('--add_ghost_skip_connection', type=int, default=0)
-    parser.add_argument('--total_many', type=int, default=32)
-    parser.add_argument('--mini_many', type=int, default=16)
-    parser.add_argument('--temperature', type=float, default=0.1)
-    parser.add_argument('--latent_sampling', type=int, default=0)
-    parser.add_argument('--small_test', type=int, default=0)
-    parser.add_argument('--erase', type=int, default=1)
-    args = parser.parse_args()
-
+def initialize_judger(args) -> Union[TestGroundForVAE, TestGroundForSFT]:
     if args.vae_type == "SFT":
         if args.cvae_model_path is not None:
-            args.sft_model_path = args.cvae_model_path#get_last_checkpoint(args.cvae_model_path)
+            args.sft_model_path = args.cvae_model_path  # get_last_checkpoint(args.cvae_model_path)
             args.output_dir = args.sft_model_path
         else:
             args.output_dir = os.path.join(root, f"sft/{args.base_model_name}-{args.dataset_name}")
             args.sft_model_path = get_last_checkpoint(args.output_dir)
-        #args.sft_model_path = "/mnt/dolphinfs/hdd_pool/docker/user/hadoop-aipnlp/zhangjianfei09/CLaP/sft/llama3-8b-plato_dailydialog-ep10--gbs32-mbs4/checkpoint-347/"
-        #args.sft_model_path = "/mnt/dolphinfs/hdd_pool/docker/user/hadoop-aipnlp/zhangjianfei09/CLaP/sft/llama3-8b-plato_dailydialog--gbs32-mbs4/checkpoint-312/"
-        #args.sft_model_path = "/mnt/dolphinfs/hdd_pool/docker/user/hadoop-aipnlp/zhangjianfei09/CLaP/sft/llama3-8b-plato_dailydialog-v3-ep10-gbs32-mbs4/checkpoint-694/"
-        #args.sft_model_path = "/mnt/dolphinfs/hdd_pool/docker/user/hadoop-aipnlp/zhangjianfei09/CLaP/sft/llama3-8b-plato_dailydialog-v3-gbs32-mbs4/checkpoint-624/"
-        #args.sft_model_path = "/mnt/dolphinfs/hdd_pool/docker/user/hadoop-aipnlp/zhangjianfei09/CLaP/sft/llama3-8b-plato_dailydialog-v3-gbs64-mbs4/checkpoint-312/"
-        args.temperature = args.add_skip_connection + args.add_ghost_skip_connection / 10
         print(json.dumps(vars(args), ensure_ascii=False, indent=4))
         judger = TestGroundForSFT(args)
     else:
-        set_default_output_dir(args)
         if args.cvae_model_path is None:
+            set_default_output_dir(args)
             args.cvae_model_path = get_last_checkpoint(args.output_dir)
-        #args.sft_model_path = get_last_checkpoint(os.path.join(root, f"sft/{args.base_model_name}-{args.dataset_name}"))
+        else:
+            args.output_dir = args.cvae_model_path
         print(json.dumps(vars(args), ensure_ascii=False, indent=4))
         judger = TestGroundForVAE(args)
+    return judger
 
-    """
-    manipulated_results = judger.test_latent_guided_generation()
-    judger.save_manipulated_results_to_csv(manipulated_results=manipulated_results)
-    """
-    """
-    most_likely_results = judger.test_most_likely_latent_guided_generation()
-    judger.save_most_likely_results_to_csv(most_likely_results=most_likely_results)
-    """
-    #if args.vae_type in ["SFT"]:
-    #    judger.test_sampling(temperature=args.temperature)
 
-    #if args.vae_type in ["Optimus", "Anneal"]:
-    #    args.small_test = True
+if __name__ == "__main__":
+    from train_cvae import get_parser
 
-    #ell_results = judger.test_encoder_language_latent()
-    #post_results = judger.test_posterior_inference()
-    #prior_results = judger.test_prior_inference()
-    #judger.save_results_to_csv(ell_results=ell_results, prior_results=prior_results, post_results=post_results)
+    parser = get_parser()
+    parser.add_argument('--temperature', type=float, default=0.1)
+    parser.add_argument('--latent_sampling', type=int, default=0)
+    parser.add_argument('--small_test', type=int, default=0)
+    parser.add_argument('--erase', type=int, default=1)
+    parser.add_argument('--test_latent', action="store_true")
+    parser.add_argument('--test_prior_inference', action="store_true")
+    parser.add_argument('--test_prior_inference_temperature', action="store_true")
+    parser.add_argument('--test_posterior_inference', action="store_true")
+    parser.add_argument('--test_interpolated_inference', action="store_true")
+    parser.add_argument('--test_manipulated_inference', action="store_true")
+    parser.add_argument('--test_dailydialog_benchmark', action="store_true")
+    parser.add_argument('--visualize_latent_and_prob', action="store_true")
+    parser.add_argument('--visualize_latent_and_position', action="store_true")
+    args = parser.parse_args()
 
-    interpolation_results = judger.test_interpolation(num_test_shots="all")
-    judger.save_interpolation_results_to_csv(interpolation_results=interpolation_results, postfix="-all-shots")
+    judger = initialize_judger(args)
 
-    #prior_results = judger.test_prior_inference_with_different_temperature()
-    #judger.save_prior_inference_with_different_temperature_results_to_csv(prior_results=prior_results)
+    if args.test_latent:
+        ell_results = judger.test_encoder_language_latent()
+        print(f"ell_results: {ell_results}")
 
-    #judger.test_yelp_interpolation()
-    #judger.test_sampling_single()
-    #judger.test_prior_mean_greedy()
+    if args.test_prior_inference:
+        prior_results = judger.test_prior_inference()
+        print(f"prior_results: {prior_results}")
+
+    if args.test_prior_inference_temperature:
+        prior_temperature_results = judger.test_prior_inference_with_different_temperature()
+        print(f"prior_temperature_results: {prior_temperature_results}")
+
+    if args.test_posterior_inference:
+        post_results = judger.test_posterior_inference()
+        print(f"post_results: {post_results}")
+
+    if args.test_interpolated_inference:
+        interpolation_results = judger.test_interpolation(num_test_shots="all")
+        print(f"interpolation_results: {interpolation_results}")
+
+    if args.test_manipulated_inference:
+        manipulated_results = judger.test_latent_guided_generation()
+        print(f"manipulated_results: {manipulated_results}")
+
+    if args.test_dailydialog_benchmark:
+        judger.test_dailydialog()
+
+    if args.visualize_latent_and_prob:
+        pass
+        # this visualization is done by another project: https://github.com/zhangjf-nlp/LatentDPO
+        # we will migrate it into here immediately
+
+    if args.visualize_latent_and_position:
+        judger.visualize_all_latent()

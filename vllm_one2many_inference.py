@@ -11,6 +11,7 @@ from config import root
 
 def run_vllm_one2many_inference(args, tasks, output_max_length):
     from vllm import LLM, SamplingParams
+    print(f"args.sft_model_path: {args.sft_model_path}")
     llm = LLM(
         model=args.sft_model_path,
         trust_remote_code=True,
@@ -71,7 +72,7 @@ def main():
     parser = argparse.ArgumentParser(description="parse args for vllm one-to-many inference")
     parser.add_argument('--sft_model_path', type=str, default=None)
     parser.add_argument('--base_model_name', type=str, default="llama3-8b")
-    parser.add_argument('--dataset_name', type=str, default="plato_dailydialog")
+    parser.add_argument('--dataset_name', type=str, default="dailydialog")
     parser.add_argument('--index_split', type=int, default=1)
     parser.add_argument('--num_splits', type=int, default=10)
     parser.add_argument('--erase', type=int, default=1)

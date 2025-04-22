@@ -90,14 +90,16 @@ def get_trainer(args, model, tokenizer, train_dataset, valid_dataset, collate_fn
         "train_micro_batch_size_per_gpu": args.mini_batch_size,
         "gradient_accumulation_steps": gradient_accumulation_steps,
         "fp16": {"enabled": True, "min_loss_scale": 1, "opt_level": "O2"},
-        "zero_optimization": {"stage": 2, "offload_optimizer": {"device": "cpu", "pin_memory": True}},
+        "zero_optimization": {"stage": 1},
+        #"zero_optimization": {"stage": 2},# "offload_optimizer": {"device": "cpu", "pin_memory": True}},
         "optimizer": {"type": "AdamW", "params": {"lr": args.learning_rate}},
         "scheduler": {"type": "WarmupLR", "params": {
                 "warmup_min_lr": "auto",
                 "warmup_max_lr": "auto",
                 "warmup_num_steps": "auto",
             }
-        }
+        },
+        #"checkpoint": {"load_universal": True},
     }
 
     training_args = TrainingArguments(
@@ -135,11 +137,14 @@ def get_trainer(args, model, tokenizer, train_dataset, valid_dataset, collate_fn
 
 
 def get_last_checkpoint(folder):
+    folder = folder.rstrip("/")
     if not os.path.exists(folder):
         return None
     if os.path.basename(folder) == "best_model":
         return folder
     if os.path.basename(folder) == "huggingface_format":
+        return folder
+    if os.path.basename(folder).startswith("checkpoint"):
         return folder
     PREFIX_CHECKPOINT_DIR = "checkpoint"
     _re_checkpoint = re.compile(r"^" + PREFIX_CHECKPOINT_DIR + r"\-(\d+)$")

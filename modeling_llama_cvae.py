@@ -1,12 +1,16 @@
-from typing import Dict, Any
+from typing import Dict, Any, Tuple, Optional, Union, List
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
 from transformers import GenerationConfig, LogitsProcessorList, StoppingCriteriaList
-from transformers.generation.utils import GenerateOutput
-from transformers.models.llama.modeling_llama import *
+from transformers.generation.utils import GenerateOutput, CausalLMOutputWithPast
+from transformers.models.llama.modeling_llama import LlamaConfig, LlamaPreTrainedModel, LlamaModel, LlamaAttention, LlamaForCausalLM, LlamaRMSNorm, LlamaDecoderLayer
+from transformers import DynamicCache, Cache
 
 from utils import load_sharded_prefix_checkpoint
-from utils_latent import sampling, compute_kl_penalty, log_pdf, exp_mean_log
+from utils_latent import sampling, compute_kl_penalty, log_pdf, exp_mean_log, compute_mi
 
 
 # CVAE structure outline
@@ -39,12 +43,10 @@ class LlamaCVAEConfig(LlamaConfig):
         num_p = 4,
         num_latent_encoder_layers = 2,
         # for training details
-        frozen_pretrained = 1,
-        use_standard_prior = 1,
+        frozen_stage = 2, # 0: full parameter; 1: frozen backbone llm; 2: frozen adapter attn and encoder embed
         vae_type = "DG-VAE",
-        add_contra_loss = 1,
         add_skip_connection = 0,
-        add_ghost_skip_connection = 0,
+        add_gskip_connection = 1,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -54,12 +56,10 @@ class LlamaCVAEConfig(LlamaConfig):
         self.num_p = num_p
         self.num_latent_encoder_layers = num_latent_encoder_layers
         # for training details
-        self.frozen_pretrained = frozen_pretrained
-        self.use_standard_prior = use_standard_prior
+        self.frozen_stage = frozen_stage
         self.vae_type = vae_type
-        self.add_contra_loss = add_contra_loss
         self.add_skip_connection = add_skip_connection
-        self.add_ghost_skip_connection = add_ghost_skip_connection
+        self.add_gskip_connection = add_gskip_connection
         # others
         self.pad_token_id = self.eos_token_id
 
@@ -85,6 +85,7 @@ class LlamaForLatentEncoder(LlamaPreTrainedModel):
             nn.SiLU(),
             nn.Linear(config.hidden_size, config.dim_z * 2 // config.num_q)
         )
+        self.embed_tokens.requires_grad_(config.frozen_stage<2)
         self.post_init()
 
     def load_pretrained(self, pretrained_model: LlamaForCausalLM):
@@ -148,7 +149,7 @@ class LlamaForLatentEncoder(LlamaPreTrainedModel):
         return mean, logvar
 
 
-class LlamaForLatentTranslator(LlamaPreTrainedModel):
+class LlamaForLatentAdapter(LlamaPreTrainedModel):
     # latent adapter
     config_class = LlamaCVAEConfig
     main_input_name = "latent_mean_logvar"
@@ -158,12 +159,13 @@ class LlamaForLatentTranslator(LlamaPreTrainedModel):
         super().__init__(config)
         self.layer_idx = layer_idx
         self.z2h = nn.Sequential(
-            nn.Linear(config.dim_z, config.hidden_size),
+            nn.Linear(config.dim_z, int(config.hidden_size ** 0.5)),
             nn.GELU(),
-            nn.Linear(config.hidden_size, config.hidden_size * config.num_p),
+            nn.Linear(int(config.hidden_size ** 0.5), config.hidden_size * config.num_p),
         )
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.self_attn = LlamaAttention(config, layer_idx=layer_idx)
+        self.self_attn.requires_grad_(config.frozen_stage<2)
 
     def load_pretrained(self, pretrained_model: LlamaForCausalLM):
         self.self_attn.load_state_dict(pretrained_model.model.layers[self.layer_idx].self_attn.state_dict())
@@ -193,18 +195,18 @@ class LlamaForLatentDecoder(LlamaPreTrainedModel):
 
     def __init__(self, config: LlamaCVAEConfig):
         super().__init__(config)
-        self.latent_translators = nn.ModuleList([
-            LlamaForLatentTranslator(config, layer_idx)
+        self.latent_adapters = nn.ModuleList([
+            LlamaForLatentAdapter(config, layer_idx)
             for layer_idx in range(config.num_hidden_layers)
         ])
-        if config.add_skip_connection == 1 or config.add_ghost_skip_connection == 1:
+        if config.add_skip_connection == 1 or config.add_gskip_connection == 1:
             self.skip_connection = nn.Sequential(
                 nn.Linear(config.dim_z, config.hidden_size),
                 nn.SiLU(),
                 nn.Linear(config.hidden_size, config.hidden_size),
                 LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps),
             )
-        elif config.add_skip_connection == 2 or config.add_ghost_skip_connection == 2:
+        elif config.add_skip_connection == 2 or config.add_gskip_connection == 2:
             self.skip_connection = nn.Sequential(
                 nn.Linear(config.dim_z, config.hidden_size),
             )
@@ -218,12 +220,12 @@ class LlamaForLatentDecoder(LlamaPreTrainedModel):
 
         self.model = LlamaModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.model.requires_grad_(not config.frozen_pretrained)
-        self.lm_head.requires_grad_(not config.frozen_pretrained)
+        self.model.requires_grad_(config.frozen_stage<1)
+        self.lm_head.requires_grad_(config.frozen_stage<1)
 
     def load_pretrained(self, pretrained_model: LlamaForCausalLM):
         for layer_idx in range(self.config.num_hidden_layers):
-            self.latent_translators[layer_idx].load_pretrained(pretrained_model)
+            self.latent_adapters[layer_idx].load_pretrained(pretrained_model)
         self.model.load_state_dict(pretrained_model.model.state_dict())
         self.lm_head.load_state_dict(pretrained_model.lm_head.state_dict())
 
@@ -236,7 +238,7 @@ class LlamaForLatentDecoder(LlamaPreTrainedModel):
         zs = sampling(mean, logvar, latent_sampling_times) # [bs, dim_z, nz]
         zs = zs.to(self.dtype)
         skip_residue = self.skip_connection(zs.transpose(1, 2)).mean(dim=1, keepdim=True) # [bs, 1, hidden_size]
-        if self.config.add_ghost_skip_connection:
+        if self.config.add_gskip_connection:
             skip_residue = (skip_residue - skip_residue.detach()) # equals to 0 but has gradient
         return skip_residue
 
@@ -266,7 +268,7 @@ class LlamaForLatentDecoder(LlamaPreTrainedModel):
         zs = zs.to(self.dtype)
         past_key_values = DynamicCache()
         for layer_idx in range(self.config.num_hidden_layers):
-            past_key_values = self.latent_translators[layer_idx].forward(
+            past_key_values = self.latent_adapters[layer_idx].forward(
                 zs=zs, past_key_values=past_key_values
             )
         return past_key_values
@@ -330,7 +332,7 @@ class LlamaForLatentDecoder(LlamaPreTrainedModel):
             cache_position=cache_position,
         )
         hidden_states = outputs[0]
-        if self.config.add_skip_connection or self.config.add_ghost_skip_connection:
+        if self.config.add_skip_connection or self.config.add_gskip_connection:
             if past_skip_residue is None:
                 skip_residue = self.convert_latent_into_skip_residue(latent_mean_logvar)
             else:
@@ -466,7 +468,7 @@ class LlamaForCVAE(LlamaPreTrainedModel):
             self.z2logits[-1].load_state_dict(pretrained_model.lm_head.state_dict())
 
     def update_config(self, new_config):
-        attr_mutable = ["frozen_pretrained", "add_contra_loss", "add_skip_connection", "add_ghost_skip_connection"]
+        attr_mutable = ["frozen_stage", "add_contra_loss", "add_skip_connection", "add_gskip_connection"]
         fail = False
         for attr in new_config:
             if attr in attr_mutable:
@@ -476,8 +478,11 @@ class LlamaForCVAE(LlamaPreTrainedModel):
                 if not self_value == new_value:
                     print(f"immutable attr {attr} not match: {self_value} != {new_value}")
                     fail = True
-        self.latent_decoder.model.requires_grad_(not self.config.frozen_pretrained)
-        self.latent_decoder.lm_head.requires_grad_(not self.config.frozen_pretrained)
+        self.latent_encoder.embed_tokens.requires_grad_(self.config.frozen_stage<2)
+        for adapter in self.latent_decoder.latent_adapters:
+            adapter.self_attn.requires_grad_(self.config.frozen_stage<2)
+        self.latent_decoder.model.requires_grad_(self.config.frozen_stage<1)
+        self.latent_decoder.lm_head.requires_grad_(self.config.frozen_stage<1)
         assert not fail
 
     # for latent_encoder
@@ -520,36 +525,15 @@ class LlamaForCVAE(LlamaPreTrainedModel):
             loss_kld = compute_kl_penalty(mean, logvar, vae_type=self.config.vae_type,
                                           train_steps=getattr(self.config, "train_steps", 1000),
                                           eval_steps=getattr(self.config, "eval_steps", 1000))
-        if not self.config.add_contra_loss:
-            loss_lm = self.latent_decoder(
-                latent_mean_logvar = latent_mean_logvar,
-                input_ids = input_ids,
-                attention_mask = attention_mask,
-                labels = labels,
-            )[0]
-            loss_contra = torch.zeros_like(loss_lm)
-        else:
-            cross_nlls = []
-            for bias in range(batch_size):
-                biased_latent_mean_logvar = [torch.roll(_, shifts=bias, dims=0) for _ in latent_mean_logvar]
-                biased_nlls = self.latent_decoder(
-                    latent_mean_logvar = biased_latent_mean_logvar,
-                    input_ids = input_ids,
-                    attention_mask = attention_mask,
-                    labels = labels,
-                    scalar_loss = False,
-                )[0]
-                cross_nlls.append(biased_nlls)
-            cross_nlls = torch.stack(cross_nlls, dim=0) # [0, :] is positive, and [1:, :] are negative
-            loss_lm = cross_nlls[0, :].mean()
-            loss_contra = F.cross_entropy(
-                input = -cross_nlls.T,
-                target = torch.zeros(batch_size, dtype=torch.int64, device=cross_nlls.device),
-                reduction = 'mean'
-            )
-
-        loss = loss_kld + loss_lm + loss_contra
-        return loss, loss_kld, loss_lm, loss_contra
+        loss_lm = self.latent_decoder(
+            latent_mean_logvar = latent_mean_logvar,
+            input_ids = input_ids,
+            attention_mask = attention_mask,
+            labels = labels,
+        )[0]
+        mi = compute_mi(mean, logvar)
+        loss = loss_kld + loss_lm
+        return loss, loss_kld, loss_lm, mi
 
     def generate(
         self,
@@ -591,7 +575,7 @@ class LlamaForCVAE(LlamaPreTrainedModel):
                 latent_mean_logvar[1].repeat_interleave(kv_expand_size, dim=0)
             )
 
-        if self.config.add_skip_connection or self.config.add_ghost_skip_connection:
+        if self.config.add_skip_connection or self.config.add_gskip_connection:
             skip_residue = self.latent_decoder.convert_latent_into_skip_residue(latent_mean_logvar=latent_mean_logvar)
             past_skip_residue = (skip_residue,)
         else:
@@ -706,70 +690,3 @@ class LlamaForLatentDPO(LlamaPreTrainedModel):
         loss = -F.logsigmoid((chosen_reward - rejected_reward) * self.beta)
         acc = (chosen_reward > rejected_reward).float()
         return loss.mean(), acc.mean()
-
-
-
-
-
-class LlamaForLatentEncoderGMM(LlamaForLatentEncoder):
-    def __init__(self, config, K=16):
-        super().__init__(config)
-        self.K = K
-        self.h2z = nn.Sequential(
-            nn.Linear(config.hidden_size, config.hidden_size),
-            nn.SiLU(),
-            nn.Linear(config.hidden_size, (config.dim_z * 2 + 1) * K // config.num_q)
-        )
-
-    def forward(
-        self,
-        posterior_input_ids: torch.LongTensor = None,
-        posterior_attention_mask: torch.FloatTensor = None,
-    ):
-        batch_size, seq_len = posterior_input_ids.shape
-
-        posterior_embeds = self.embed_tokens(posterior_input_ids)
-        latent_query_embeds = self.embed_latent_queries(torch.arange(self.config.num_q).to(self.device))
-        inputs_embeds = torch.cat([posterior_embeds, latent_query_embeds[None, :, :].expand(batch_size, -1, -1)], dim=1)
-
-        queries_attention_mask = posterior_attention_mask.new_ones(size=[batch_size, self.config.num_q])
-        attention_mask = torch.cat([posterior_attention_mask, queries_attention_mask], dim=-1)
-        sequence_length, dtype, device = inputs_embeds.shape[1], inputs_embeds.dtype, inputs_embeds.device
-        causal_mask = torch.triu(torch.full(
-            size=(sequence_length, sequence_length),
-            fill_value=torch.finfo(dtype).min,
-            dtype=dtype, device=device
-        ), diagonal=1)
-        attention_mask = causal_mask[None, None, :, :].expand(batch_size, 1, -1, -1) + attention_mask[:, None, None, :]
-        position_ids = torch.arange(sequence_length)[None, :].expand(batch_size, -1).to(device=device)
-
-        hidden_states = inputs_embeds
-        for layer in self.layers:
-            hidden_states = layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-            )[0]
-        latent = self.h2z(self.norm(hidden_states[:, -self.config.num_q:, :]))
-        latent_dim_per_q = self.config.dim_z * self.K // self.config.num_q
-        mean = latent[:, :, :latent_dim_per_q].reshape(batch_size, self.config.dim_z * self.K)
-        logvar = latent[:, :, latent_dim_per_q: latent_dim_per_q * 2].reshape(batch_size, self.config.dim_z * self.K)
-        weights = latent[:, :, latent_dim_per_q * 2:].reshape(batch_size, self.K)
-        return mean, logvar, weights
-
-    def log_pdf(self, mean, logvar, weights, zs):
-        batch_size, dim_z = zs.shape
-        zs = zs.repeat(1, self.K)
-        logp_zs = log_pdf(mean, logvar, zs).view(batch_size, dim_z, self.K)
-        logp_zs = exp_mean_log(logp_zs, dim=-1, weights=weights)
-        return logp_zs
-
-    def sampling(self, mean, logvar, weights, n_samples):
-        batch_size = mean.shape[0]
-        indices = torch.multinomial(weights, num_samples=1, replacement=True)
-        indices = indices.unsqueeze(1).unsqueeze(2)
-        indices = indices.expand(-1, self.config.dim_z, -1, -1)
-        zs = sampling(mean, logvar, n_samples=n_samples)
-        zs = zs.view(batch_size, self.config.dim_z, self.K)
-        selected_zs = torch.gather(zs, 3, indices).squeeze(-1)
-        return selected_zs

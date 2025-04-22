@@ -22,11 +22,12 @@ def exp_mean_log(tensor, dim, weights=None):
     max_values = tensor.max(dim=dim, keepdims=True).values
     tensor = tensor - max_values
     if weights is None:
-        tensor = tensor.exp().mean(dim=dim, keepdims=True).log()
+        tensor = tensor.exp().sum(dim=dim, keepdims=True).log() - np.log(tensor.shape[dim])
     else:
         tensor = (tensor.exp() * weights).sum(dim=dim, keepdims=True).log()
     tensor = tensor + max_values
     return tensor.squeeze(dim=dim)
+
 
 anneal_steps = 0
 def get_anneal_kl_weight(p1=0.0, p2=0.5, train_steps=1000, eval_steps=0):
@@ -103,3 +104,14 @@ def compute_kl_penalty(mean, logvar, vae_type="vanilla", **kwargs):
     else:
         raise NotImplementedError(vae_type)
     return kl_penalty
+
+
+def compute_mi(mean, logvar, n_samples=16):
+    N = mean.shape[0]
+    zs = sampling(mean, logvar, n_samples)
+    log_q_yz_x = log_pdf(mean, logvar, zs).sum(dim=1) - np.log(N)
+    log_q_y_x = - np.log(N)
+    log_q_z_x = exp_mean_log(
+        log_pdf(mean[None, :, :], logvar[None, :, :], zs[:, None, :, :]).sum(dim=2), dim=1)
+    mi = (log_q_yz_x - log_q_y_x - log_q_z_x).mean(dim=0).mean(dim=-1)
+    return mi
